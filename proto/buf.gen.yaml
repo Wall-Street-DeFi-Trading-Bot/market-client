@@ -1,0 +1,9 @@
+version: v2
+
+# > buf generate
+managed:
+  enabled: true
+
+plugins:
+  - remote: buf.build/protocolbuffers/python
+    out: .

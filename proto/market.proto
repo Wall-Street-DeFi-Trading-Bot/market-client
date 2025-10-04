@@ -1,0 +1,142 @@
+// marketdata_v2.proto
+syntax = "proto3";
+
+package md;
+option go_package = "github.com/sujine/market-fetcher/proto/md";
+
+// ---- Enums ----
+enum Venue {
+  VENUE_UNSPECIFIED = 0;
+  VENUE_CEX = 1;
+  VENUE_DEX = 2;
+}
+
+enum Instrument {
+  INSTRUMENT_UNSPECIFIED = 0;
+  INSTRUMENT_SPOT = 1;
+  INSTRUMENT_PERPETUAL = 2;
+  INSTRUMENT_SWAP = 3;
+  INSTRUMENT_OPTION = 4; // reserved for future use
+}
+
+enum Aggressor {
+  AGGR_UNKNOWN = 0;
+  AGGR_BUY = 1;
+  AGGR_SELL = 2;
+}
+
+// ---- Common header ----
+message Header {
+  // Exchange identifier: e.g. "Binance", "PancakeSwapV3"
+  string exchange = 1;
+
+  // Unified symbol: e.g. "ETHUSDT", "BNB-USDT" (keep your house-style)
+  string symbol = 2;
+
+  Venue venue = 3;
+  Instrument instrument = 4;
+
+  // Monotonic-ish, event emission time in ns (UTC).
+  int64 ts_ns = 5;
+
+  // Schema version for the event family (bump when breaking).
+  uint32 schema_version = 6;
+
+  // Optional chain context for DEX (e.g., "BSC"), else empty.
+  string chain = 7;
+
+  // Optional: raw pool address for DEX tick source.
+  string pool_address = 8;
+}
+
+// ---- Normalized events ----
+message TickL1 {
+  // Best bid/ask. If not available (DEX mark-only), set bid/ask = 0 and use mid.
+  double bid = 1;
+  double ask = 2;
+  double mid = 3;
+}
+
+message DexSwapL1 {
+  // --- Raw swap event fields (as emitted by the pool) ---
+  // Signed amounts (string to keep precision): amount0<0 means token0 leaves pool (user pays token0)
+  string amount0 = 1;                 // int256 string
+  string amount1 = 2;                 // int256 string
+
+  // Pool state after the swap
+  string sqrt_price_x96 = 10;         // uint160 as string
+  sint32 tick = 11;                   // int24 fits in sint32
+  string liquidity_u128 = 12;         // uint128 as string
+
+  // Fees accrued to protocol (if present in event/log)
+  string protocol_fees_token0 = 13;   // uint128 as string
+  string protocol_fees_token1 = 14;   // uint128 as string
+
+  // --- Context / identity ---
+  string tx_hash = 21;                // transaction hash (0x…)
+  uint64 log_index = 22;              // log index within the tx
+  uint64 block_number = 23;           // block number
+  uint64 timestamp = 24;              // unix seconds
+
+  // --- Token metadata (to compute human price) ---
+  string token0 = 30;                 // symbol
+  string token1 = 31;                 // symbol
+  uint32 token0_decimals = 32;        // e.g., 18
+  uint32 token1_decimals = 33;        // e.g., 18
+
+  // --- Orientation & computed prices ---
+  // price01 = token1/token0 (pool-native). price_qb = quote/base as requested by the symbol.
+  bool invert_for_quote = 40;         // true if we inverted price01 to form quote/base
+  double price01 = 41;                  // price = (sqrtP/2^96)^2 * 10^(dec0-dec1)
+  double price10 = 42;               // price after invert if needed (what you publish as “mid”)
+}
+
+message Slippage {
+  double impact_bps01 = 1;
+  double impact_bps10 = 2; 
+  uint64 block_number = 3;   
+  string tx_hash = 4;    
+  uint64 timestamp = 5;  
+}
+
+message Volume {
+  double volume0     = 1; 
+  double volume1     = 2;
+  double high         = 3;
+  double low          = 4;
+  uint64 trades       = 5;
+}
+
+message Funding {
+  double mark_price = 1;
+  double index_price = 2;
+  double estimated_settle_price = 3;
+  double funding_rate = 4;         // per-period rate (e.g., 8h)
+  int64  next_funding_time = 5;    // ms since epoch (exchange native)
+}
+
+message Fee {
+  double maker_rate = 1; // ratio (e.g., 0.001)
+  double taker_rate = 2; // ratio
+}
+
+message Trade {
+  double price = 1;
+  double size = 2;
+  Aggressor aggressor = 3;
+}
+
+// ---- Envelope ----
+message MarketData {
+  Header header = 1;
+
+  oneof data {
+    TickL1      tick      = 10;
+    DexSwapL1   dexSwapL1 = 11;
+    Funding     funding   = 12;
+    Fee         fee       = 13;
+    Trade       trade     = 14;
+    Volume      volume     = 15; 
+    Slippage    slippage  = 16;  
+  }
+}

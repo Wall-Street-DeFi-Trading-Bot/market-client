@@ -1,0 +1,58 @@
+# ultra_light_tail.py
+import asyncio
+from market_data_client import MarketDataClient, _iso_from_ns, CexConfig, DexConfig
+
+def ms(v): return f"{v:.2f} ms" if v is not None else "n/a"
+
+async def main():
+    client = MarketDataClient(
+        nats_url="nats://127.0.0.1:4222",
+        use_jetstream=False,
+        enable_csv=False,
+        # cex=[CexConfig(
+        #     exchange="Binance",
+        #     symbols=["ETHUSDT"],
+        #     instruments=["spot", "perpetual"],
+        #     want=("tick","funding","fee","volume"),
+        # )],
+        dex=[
+            DexConfig(exchange="PancakeSwapV2", chain="BSC", pairs=["WBNBUSDT","WBNBETH"]),
+            DexConfig(exchange="PancakeSwapV3", chain="BSC", pairs=["WBNBUSDT","WBNBETH"]),
+        ],
+    )
+    await client.start()
+    print("✅ live, printing as messages arrive")
+
+    async def on_ev(ev):
+        k = ev["kind"]
+        if k == "tick":
+            print(f"[TICK] {ev['exchange']} {ev.get('symbol','')} {ev.get('instrument','')} "
+                  f"mid={ev.get('mid')} lat={ms(ev.get('lat_ms'))}")
+        elif k == "funding":
+            print(f"[FUND] {ev['exchange']} {ev['symbol']} rate={ev['rate']} next={ev['next_ms']} lat={ms(ev.get('lat_ms'))}")
+        elif k == "fee":
+            print(f"[FEE ] {ev['exchange']} {ev['symbol']} {ev.get('instrument','')} "
+                  f"maker={ev['maker_rate']} taker={ev['taker_rate']} lat={ms(ev.get('lat_ms'))}")
+        elif k == "volume":
+            print(f"[VOL ] {ev['exchange']} {ev['symbol']} {ev.get('instrument','')} "
+                  f"v0={ev['volume0']} v1={ev['volume1']} trades={ev['trades']} lat={ms(ev.get('lat_ms'))}")
+        elif k == "slippage":
+            print(f"[SLIP] {ev['exchange']} {ev['pair']} bps01={ev['bps01']} bps10={ev['bps10']} lat={ms(ev.get('lat_ms'))}")
+        elif k == "dexSwapL1":
+            print(f"[DEX ] {ev['exchange']} {ev['pair']} price={ev['price']} "
+                  f"(p01={ev['price01']} p10={ev['price10']} inv={int(ev['invert_for_quote'])}) lat={ms(ev.get('lat_ms'))}")
+            
+
+    # Binance + PancakeSwapV2 둘 다 들음
+    client.add_listener(on_ev, exchange={"Binance","PancakeSwapV2","PancakeSwapV3"})
+
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await client.stop()
+
+if __name__ == "__main__":
+    asyncio.run(main())
