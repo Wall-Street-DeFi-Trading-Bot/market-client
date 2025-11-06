@@ -842,56 +842,6 @@ class MarketDataClient:
                 "lat_ms": dp.latency_ms
             }
 
-    async def get_spot_usdt_from_dex(self, symbol_usdt: str, exchange: str, chain: str = "BSC", router_token: str = "WBNB"):
-        """
-        ETHUSDT 요청 시:
-          router= WBNB
-          price(ETH/USDT) = price(WBNB/USDT) / price(WBNB/ETH)
-        둘 다 같은 락에서 읽어 원자적 스냅샷으로 계산.
-        """
-        sym = _norm_symbol(symbol_usdt)
-        assert sym.endswith("USDT"), "symbol_usdt must end with USDT"
-        base = sym[:-4]
-
-        rq = f"{router_token}USDT"
-        rb = f"{router_token}{base}"
-
-        async with self._lock:
-            dp_rq = self.dex_pairs.get((exchange, chain, rq))
-            dp_rb = self.dex_pairs.get((exchange, chain, rb))
-            if not dp_rq or not dp_rb:
-                return None
-
-            p_rq = dp_rq.price10 if dp_rq.invert_for_quote else dp_rq.price01
-            p_rb = dp_rb.price10 if dp_rb.invert_for_quote else dp_rb.price01
-
-            if not p_rq or not p_rb:
-                return None
-
-            price = p_rq / p_rb
-            ts_ns = min(dp_rq.ts_ns, dp_rb.ts_ns)
-            lat_ms = max(dp_rq.latency_ms or 0.0, dp_rb.latency_ms or 0.0)
-
-            return {
-                "price": price,
-                "ts_ns": ts_ns,
-                "ts_iso": _iso_from_ns(ts_ns),
-                "lat_ms": lat_ms,
-                "components": {
-                    rq: {
-                        "qb": p_rq,
-                        "ts_ns": dp_rq.ts_ns,
-                        "lat_ms": dp_rq.latency_ms
-                    },
-                    rb: {
-                        "qb": p_rb,
-                        "ts_ns": dp_rb.ts_ns,
-                        "lat_ms": dp_rb.latency_ms
-                    },
-                }
-            }
-
-
 # ========================= helper builders =========================
 def _dc_copy(obj):
     return dataclasses.replace(obj) if dataclasses.is_dataclass(obj) else deepcopy(obj)

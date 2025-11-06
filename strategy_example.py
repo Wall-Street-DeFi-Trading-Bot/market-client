@@ -1,6 +1,7 @@
 # example_queries_with_latency.py
 import asyncio
 from market_data_client import make_client_simple, _iso_from_ns
+import json
 
 async def main():
     client = make_client_simple(
@@ -16,7 +17,7 @@ async def main():
     await client.start()
     print("✅ ready")
     await asyncio.sleep(3)
-    # ----- Binance (모두 같은 스냅샷으로) -----
+    # ----- Binance  -----
     t_spot = await client.get_latest_price_with_latency("ETHUSDT", "Binance", "spot")
     t_perp = await client.get_latest_price_with_latency("ETHUSDT", "Binance", "perpetual")
     f_meta = await client.get_funding_meta("ETHUSDT", "Binance")
@@ -25,8 +26,8 @@ async def main():
     fee_sp  = await client.get_fee_meta("ETHUSDT", "Binance", "spot")
     fee_pp  = await client.get_fee_meta("ETHUSDT", "Binance", "perpetual")
 
-    # ----- PancakeSwapV2 (ETH/USDT 합성도 원자적) -----
-    ethusdt_px = await client.get_spot_usdt_from_dex("ETHUSDT", "PancakeSwapV2", chain="BSC", router_token="WBNB")
+    # ----- PancakeSwapV2  -----
+    dex_price  = await client.get_dex_price_qb("WBNBUSDT", "PancakeSwapV2")
     dex_vol    = await client.get_volume_meta("WBNBUSDT", "PancakeSwapV2", "swap")
     dex_fee    = await client.get_fee_meta("WBNBUSDT", "PancakeSwapV2", "swap")
     dex_slip   = await client.get_slippage_meta("WBNBUSDT", "PancakeSwapV2")
@@ -51,12 +52,7 @@ async def main():
     print(f"Fee perp     : {vars(fee_pp) if fee_pp else None}")
 
     print("\n--- PancakeSwapV2 (BSC) ---")
-    if ethusdt_px:
-        print(f"Spot(ETH/USDT): {ethusdt_px['price']} (lat≈{ethusdt_px['lat_ms']:.2f} ms @ {ethusdt_px['ts_iso']})")
-        # 필요하면 구성요소도 노출
-        # print("components:", ethusdt_px["components"])
-    else:
-        print("Spot(ETH/USDT): None")
+    print("Price (WBNBUSDT):", dex_price["price_qb"])
     print(f"Volume (WBNBUSDT): {vars(dex_vol) if dex_vol else None}")
     print(f"Fee    (WBNBUSDT): {vars(dex_fee) if dex_fee else None}")
     print(f"Slip   (WBNBUSDT): {vars(dex_slip) if dex_slip else None}")

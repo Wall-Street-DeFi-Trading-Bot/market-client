@@ -1,0 +1,16 @@
+# Bytecode caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+nats-data/
+market_logs/
+*.csv
+
+# Virtual environments
+.venv/
+.env/
+
+# Mac metadata
+.DS_Store

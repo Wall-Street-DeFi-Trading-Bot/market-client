@@ -8,7 +8,7 @@ async def main():
     client = MarketDataClient(
         nats_url="nats://127.0.0.1:4222",
         use_jetstream=False,
-        enable_csv=False,
+        enable_csv=True,
         # cex=[CexConfig(
         #     exchange="Binance",
         #     symbols=["ETHUSDT"],
