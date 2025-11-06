@@ -9,12 +9,12 @@ async def main():
         nats_url="nats://127.0.0.1:4222",
         use_jetstream=False,
         enable_csv=True,
-        # cex=[CexConfig(
-        #     exchange="Binance",
-        #     symbols=["ETHUSDT"],
-        #     instruments=["spot", "perpetual"],
-        #     want=("tick","funding","fee","volume"),
-        # )],
+        cex=[CexConfig(
+            exchange="Binance",
+            symbols=["ETHUSDT"],
+            instruments=["spot", "perpetual"],
+            want=("tick","funding","fee","volume"),
+        )],
         dex=[
             DexConfig(exchange="PancakeSwapV2", chain="BSC", pairs=["WBNBUSDT","WBNBETH"]),
             DexConfig(exchange="PancakeSwapV3", chain="BSC", pairs=["WBNBUSDT","WBNBETH"]),
