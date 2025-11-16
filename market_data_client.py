@@ -118,9 +118,11 @@ class Tick:
     bid: float
     ask: float
     mid: float
-    ts_ns: int
+    source_ts_ns: int
+    publish_ts_ns: int
     instrument: str
-    latency_ms: Optional[float] = None
+    lat_source_ms: Optional[float] = None
+    lat_publish_ms: Optional[float] = None
 
 
 @dataclasses.dataclass
@@ -130,16 +132,20 @@ class Funding:
     est_settle_price: float
     funding_rate: float
     next_funding_time_ms: int
-    ts_ns: int
-    latency_ms: Optional[float] = None
+    source_ts_ns: int
+    publish_ts_ns: int
+    lat_source_ms: Optional[float] = None
+    lat_publish_ms: Optional[float] = None
 
 
 @dataclasses.dataclass
 class Fee:
     maker_rate: float
     taker_rate: float
-    ts_ns: int
-    latency_ms: Optional[float] = None
+    source_ts_ns: int
+    publish_ts_ns: int
+    lat_source_ms: Optional[float] = None
+    lat_publish_ms: Optional[float] = None
 
 
 @dataclasses.dataclass
@@ -149,8 +155,10 @@ class Volume:
     high: float
     low: float
     trades: int
-    ts_ns: int
-    latency_ms: Optional[float] = None
+    source_ts_ns: int
+    publish_ts_ns: int
+    lat_source_ms: Optional[float] = None
+    lat_publish_ms: Optional[float] = None
 
 
 @dataclasses.dataclass
@@ -159,8 +167,10 @@ class Slippage:
     impact_bps10: float
     block_number: int
     tx_hash: str
-    ts_ns: int
-    latency_ms: Optional[float] = None
+    source_ts_ns: int
+    publish_ts_ns: int
+    lat_source_ms: Optional[float] = None
+    lat_publish_ms: Optional[float] = None
 
 
 @dataclasses.dataclass
@@ -173,8 +183,10 @@ class DexPair:
     price01: float
     price10: float
     invert_for_quote: bool
-    ts_ns: int
-    latency_ms: Optional[float] = None
+    source_ts_ns: int
+    publish_ts_ns: int
+    lat_source_ms: Optional[float] = None
+    lat_publish_ms: Optional[float] = None
 
 
 # ========================= config model =========================
@@ -392,30 +404,62 @@ class MarketDataClient:
                     await msg.ack()
                 return
 
-            exch = md.header.exchange
-            sym = md.header.symbol or ""
-            inst = _instrument_short(md.header.instrument)
-            ts_ns = md.header.ts_ns
+            hdr = md.header
+            exch = hdr.exchange
+            sym = hdr.symbol or ""
+            inst = _instrument_short(hdr.instrument)
+
+            source_ts_ns = getattr(hdr, "source_ts_ns", 0) or getattr(hdr, "ts_ns", 0)
+            publish_ts_ns = getattr(hdr, "publish_ts_ns", 0) or getattr(hdr, "ts_ns", 0) or source_ts_ns
 
             now_ns = time.time_ns()
-            lat_ms = ((now_ns - ts_ns) / 1e6) if ts_ns else None
+            lat_source_ms = ((now_ns - source_ts_ns) / 1e6) if source_ts_ns else None
+            lat_publish_ms = ((now_ns - publish_ts_ns) / 1e6) if publish_ts_ns else None
 
             if subject.startswith("md.tick.dex.") and which == "dexSwapL1":
                 parts = subject.split(".")
                 ex, chain, pair = (parts[3], parts[4], parts[5]) if len(parts) >= 7 else (exch, "BSC", sym)
-                await self._h_dexswapl1(ex, chain, pair, node, ts_ns, lat_ms)
-                await self._h_dex_as_tick(ex, pair, node, ts_ns, lat_ms)
+                await self._h_dexswapl1(
+                    ex, chain, pair, node,
+                    source_ts_ns, publish_ts_ns,
+                    lat_source_ms, lat_publish_ms,
+                )
+                await self._h_dex_as_tick(
+                    ex, pair, node,
+                    source_ts_ns, publish_ts_ns,
+                    lat_source_ms, lat_publish_ms,
+                )
 
             elif which == "tick":
-                await self._h_tick(exch, sym, inst, node, ts_ns, lat_ms)
+                await self._h_tick(
+                    exch, sym, inst, node,
+                    source_ts_ns, publish_ts_ns,
+                    lat_source_ms, lat_publish_ms,
+                )
             elif which == "funding":
-                await self._h_funding(exch, sym, node, ts_ns, lat_ms)
+                await self._h_funding(
+                    exch, sym, node,
+                    source_ts_ns, publish_ts_ns,
+                    lat_source_ms, lat_publish_ms,
+                )
             elif which == "fee":
-                await self._h_fee(exch, sym, inst, node, ts_ns, lat_ms)
+                await self._h_fee(
+                    exch, sym, inst, node,
+                    source_ts_ns, publish_ts_ns,
+                    lat_source_ms, lat_publish_ms,
+                )
             elif which == "volume":
-                await self._h_volume(exch, sym, inst, node, ts_ns, lat_ms)
+                await self._h_volume(
+                    exch, sym, inst, node,
+                    source_ts_ns, publish_ts_ns,
+                    lat_source_ms, lat_publish_ms,
+                )
             elif which == "slippage":
-                await self._h_slippage(exch, sym, node, ts_ns, lat_ms)
+                await self._h_slippage(
+                    exch, sym, node,
+                    source_ts_ns, publish_ts_ns,
+                    lat_source_ms, lat_publish_ms,
+                )
             else:
                 logger.debug(f"Unknown message type: {which}")
 
@@ -430,145 +474,316 @@ class MarketDataClient:
                 except Exception:
                     pass
 
+
     # --------------- handlers (cache + CSV + emit) ---------------
-    async def _h_tick(self, exchange: str, symbol: str, instrument: str, t, ts_ns: int, lat_ms: Optional[float]):
+    async def _h_tick(
+        self,
+        exchange: str,
+        symbol: str,
+        instrument: str,
+        t,
+        source_ts_ns: int,
+        publish_ts_ns: int,
+        lat_source_ms: Optional[float],
+        lat_publish_ms: Optional[float],
+    ):
+        norm_sym = _norm_symbol(symbol)
+        inst = instrument.lower()
+
         async with self._lock:
-            self.ticks[(exchange, symbol, instrument)] = Tick(t.bid, t.ask, t.mid, ts_ns, instrument, latency_ms=lat_ms)
+            self.ticks[(exchange, norm_sym, inst)] = Tick(
+                bid=t.bid,
+                ask=t.ask,
+                mid=t.mid,
+                source_ts_ns=source_ts_ns,
+                publish_ts_ns=publish_ts_ns,
+                instrument=inst,
+                lat_source_ms=lat_source_ms,
+                lat_publish_ms=lat_publish_ms,
+            )
 
         if self.enable_csv and self.csv_dir:
             await _csv_write(
                 os.path.join(self.csv_dir, "ticks.csv"),
-                ["timestamp", "exchange", "symbol", "instrument", "bid", "ask", "mid", "lat_ms"],
+                [
+                    "timestamp_source",
+                    "timestamp_publish",
+                    "exchange",
+                    "symbol",
+                    "instrument",
+                    "bid",
+                    "ask",
+                    "mid",
+                    "lat_source_ms",
+                    "lat_publish_ms",
+                ],
                 {
-                    "timestamp": _iso_from_ns(ts_ns),
+                    "timestamp_source": _iso_from_ns(source_ts_ns),
+                    "timestamp_publish": _iso_from_ns(publish_ts_ns),
                     "exchange": exchange,
-                    "symbol": symbol,
-                    "instrument": instrument,
+                    "symbol": norm_sym,
+                    "instrument": inst,
                     "bid": t.bid,
                     "ask": t.ask,
                     "mid": t.mid,
-                    "lat_ms": f"{lat_ms:.2f}" if lat_ms is not None else ""
-                }
+                    "lat_source_ms": f"{lat_source_ms:.2f}" if lat_source_ms is not None else "",
+                    "lat_publish_ms": f"{lat_publish_ms:.2f}" if lat_publish_ms is not None else "",
+                },
             )
 
         await self._emit({
             "kind": "tick",
             "exchange": exchange,
-            "symbol": symbol,
-            "instrument": instrument,
+            "symbol": norm_sym,
+            "instrument": inst,
             "mid": t.mid,
             "bid": t.bid,
             "ask": t.ask,
-            "ts_ns": ts_ns,
-            "lat_ms": lat_ms,
+            "source_ts_ns": source_ts_ns,
+            "publish_ts_ns": publish_ts_ns,
+            "source_ts_iso": _iso_from_ns(source_ts_ns),
+            "publish_ts_iso": _iso_from_ns(publish_ts_ns),
+            "lat_source_ms": lat_source_ms,
+            "lat_publish_ms": lat_publish_ms,
+            # backward compat
+            "ts_ns": source_ts_ns,
+            "lat_ms": lat_source_ms,
         })
 
-    async def _h_funding(self, exchange: str, symbol: str, f, ts_ns: int, lat_ms: Optional[float]):
+    async def _h_funding(
+        self,
+        exchange: str,
+        symbol: str,
+        f,
+        source_ts_ns: int,
+        publish_ts_ns: int,
+        lat_source_ms: Optional[float],
+        lat_publish_ms: Optional[float],
+    ):
+        norm_sym = _norm_symbol(symbol)
         async with self._lock:
-            self.funding[(exchange, symbol)] = Funding(
-                f.mark_price,
-                f.index_price,
-                f.estimated_settle_price,
-                f.funding_rate,
-                f.next_funding_time,
-                ts_ns,
-                latency_ms=lat_ms
+            self.funding[(exchange, norm_sym)] = Funding(
+                mark_price=f.mark_price,
+                index_price=f.index_price,
+                est_settle_price=f.estimated_settle_price,
+                funding_rate=f.funding_rate,
+                next_funding_time_ms=f.next_funding_time,
+                source_ts_ns=source_ts_ns,
+                publish_ts_ns=publish_ts_ns,
+                lat_source_ms=lat_source_ms,
+                lat_publish_ms=lat_publish_ms,
             )
 
         if self.enable_csv and self.csv_dir:
             await _csv_write(
                 os.path.join(self.csv_dir, "funding.csv"),
-                ["timestamp", "exchange", "symbol", "mark_price", "index_price", "est_settle_price", "funding_rate", "next_funding_time_ms", "lat_ms"],
+                [
+                    "timestamp_source",
+                    "timestamp_publish",
+                    "exchange",
+                    "symbol",
+                    "mark_price",
+                    "index_price",
+                    "est_settle_price",
+                    "funding_rate",
+                    "next_funding_time_ms",
+                    "lat_source_ms",
+                    "lat_publish_ms",
+                ],
                 {
-                    "timestamp": _iso_from_ns(ts_ns),
+                    "timestamp_source": _iso_from_ns(source_ts_ns),
+                    "timestamp_publish": _iso_from_ns(publish_ts_ns),
                     "exchange": exchange,
-                    "symbol": symbol,
+                    "symbol": norm_sym,
                     "mark_price": f.mark_price,
                     "index_price": f.index_price,
                     "est_settle_price": f.estimated_settle_price,
                     "funding_rate": f.funding_rate,
                     "next_funding_time_ms": f.next_funding_time,
-                    "lat_ms": f"{lat_ms:.2f}" if lat_ms is not None else ""
-                }
+                    "lat_source_ms": f"{lat_source_ms:.2f}" if lat_source_ms is not None else "",
+                    "lat_publish_ms": f"{lat_publish_ms:.2f}" if lat_publish_ms is not None else "",
+                },
             )
 
         await self._emit({
             "kind": "funding",
             "exchange": exchange,
-            "symbol": symbol,
+            "symbol": norm_sym,
             "rate": f.funding_rate,
             "next_ms": f.next_funding_time,
-            "ts_ns": ts_ns,
-            "lat_ms": lat_ms,
+            "source_ts_ns": source_ts_ns,
+            "publish_ts_ns": publish_ts_ns,
+            "source_ts_iso": _iso_from_ns(source_ts_ns),
+            "publish_ts_iso": _iso_from_ns(publish_ts_ns),
+            "lat_source_ms": lat_source_ms,
+            "lat_publish_ms": lat_publish_ms,
+            # backward compat
+            "ts_ns": source_ts_ns,
+            "lat_ms": lat_source_ms,
         })
 
-    async def _h_fee(self, exchange: str, symbol: str, instrument: str, f, ts_ns: int, lat_ms: Optional[float]):
+
+    async def _h_fee(
+        self,
+        exchange: str,
+        symbol: str,
+        instrument: str,
+        f,
+        source_ts_ns: int,
+        publish_ts_ns: int,
+        lat_source_ms: Optional[float],
+        lat_publish_ms: Optional[float],
+    ):
+        norm_sym = _norm_symbol(symbol)
+        inst = instrument.lower()
         async with self._lock:
-            self.fees[(exchange, symbol, instrument)] = Fee(f.maker_rate, f.taker_rate, ts_ns, latency_ms=lat_ms)
+            self.fees[(exchange, norm_sym, inst)] = Fee(
+                maker_rate=f.maker_rate,
+                taker_rate=f.taker_rate,
+                source_ts_ns=source_ts_ns,
+                publish_ts_ns=publish_ts_ns,
+                lat_source_ms=lat_source_ms,
+                lat_publish_ms=lat_publish_ms,
+            )
 
         if self.enable_csv and self.csv_dir:
             await _csv_write(
                 os.path.join(self.csv_dir, "fees.csv"),
-                ["timestamp", "exchange", "symbol", "instrument", "taker_bps", "maker_bps", "lat_ms"],
+                [
+                    "timestamp_source",
+                    "timestamp_publish",
+                    "exchange",
+                    "symbol",
+                    "instrument",
+                    "taker_bps",
+                    "maker_bps",
+                    "lat_source_ms",
+                    "lat_publish_ms",
+                ],
                 {
-                    "timestamp": _iso_from_ns(ts_ns),
+                    "timestamp_source": _iso_from_ns(source_ts_ns),
+                    "timestamp_publish": _iso_from_ns(publish_ts_ns),
                     "exchange": exchange,
-                    "symbol": symbol,
-                    "instrument": instrument,
+                    "symbol": norm_sym,
+                    "instrument": inst,
                     "taker_bps": f"{(f.taker_rate * 10000.0):.6f}",
                     "maker_bps": f"{(f.maker_rate * 10000.0):.6f}",
-                    "lat_ms": f"{lat_ms:.2f}" if lat_ms is not None else ""
-                }
+                    "lat_source_ms": f"{lat_source_ms:.2f}" if lat_source_ms is not None else "",
+                    "lat_publish_ms": f"{lat_publish_ms:.2f}" if lat_publish_ms is not None else "",
+                },
             )
 
         await self._emit({
             "kind": "fee",
             "exchange": exchange,
-            "symbol": symbol,
-            "instrument": instrument,
+            "symbol": norm_sym,
+            "instrument": inst,
             "maker_rate": f.maker_rate,
             "taker_rate": f.taker_rate,
-            "ts_ns": ts_ns,
-            "lat_ms": lat_ms,
+            "source_ts_ns": source_ts_ns,
+            "publish_ts_ns": publish_ts_ns,
+            "source_ts_iso": _iso_from_ns(source_ts_ns),
+            "publish_ts_iso": _iso_from_ns(publish_ts_ns),
+            "lat_source_ms": lat_source_ms,
+            "lat_publish_ms": lat_publish_ms,
+            # backward compat
+            "ts_ns": source_ts_ns,
+            "lat_ms": lat_source_ms,
         })
 
-    async def _h_volume(self, exchange: str, symbol: str, instrument: str, v, ts_ns: int, lat_ms: Optional[float]):
+
+    async def _h_volume(
+        self,
+        exchange: str,
+        symbol: str,
+        instrument: str,
+        v,
+        source_ts_ns: int,
+        publish_ts_ns: int,
+        lat_source_ms: Optional[float],
+        lat_publish_ms: Optional[float],
+    ):
+        norm_sym = _norm_symbol(symbol)
+        inst = instrument.lower()
         async with self._lock:
-            self.volume[(exchange, symbol, instrument)] = Volume(v.volume0, v.volume1, v.high, v.low, v.trades, ts_ns, latency_ms=lat_ms)
+            self.volume[(exchange, norm_sym, inst)] = Volume(
+                volume0=v.volume0,
+                volume1=v.volume1,
+                high=v.high,
+                low=v.low,
+                trades=v.trades,
+                source_ts_ns=source_ts_ns,
+                publish_ts_ns=publish_ts_ns,
+                lat_source_ms=lat_source_ms,
+                lat_publish_ms=lat_publish_ms,
+            )
 
         if self.enable_csv and self.csv_dir:
             await _csv_write(
                 os.path.join(self.csv_dir, "volume.csv"),
-                ["timestamp", "exchange", "symbol", "instrument", "volume0", "volume1", "high", "low", "trades", "lat_ms"],
+                [
+                    "timestamp_source",
+                    "timestamp_publish",
+                    "exchange",
+                    "symbol",
+                    "instrument",
+                    "volume0",
+                    "volume1",
+                    "high",
+                    "low",
+                    "trades",
+                    "lat_source_ms",
+                    "lat_publish_ms",
+                ],
                 {
-                    "timestamp": _iso_from_ns(ts_ns),
+                    "timestamp_source": _iso_from_ns(source_ts_ns),
+                    "timestamp_publish": _iso_from_ns(publish_ts_ns),
                     "exchange": exchange,
-                    "symbol": symbol,
-                    "instrument": instrument,
+                    "symbol": norm_sym,
+                    "instrument": inst,
                     "volume0": v.volume0,
                     "volume1": v.volume1,
                     "high": v.high,
                     "low": v.low,
                     "trades": v.trades,
-                    "lat_ms": f"{lat_ms:.2f}" if lat_ms is not None else ""
-                }
+                    "lat_source_ms": f"{lat_source_ms:.2f}" if lat_source_ms is not None else "",
+                    "lat_publish_ms": f"{lat_publish_ms:.2f}" if lat_publish_ms is not None else "",
+                },
             )
 
         await self._emit({
             "kind": "volume",
             "exchange": exchange,
-            "symbol": symbol,
-            "instrument": instrument,
+            "symbol": norm_sym,
+            "instrument": inst,
             "volume0": v.volume0,
             "volume1": v.volume1,
             "high": v.high,
             "low": v.low,
             "trades": v.trades,
-            "ts_ns": ts_ns,
-            "lat_ms": lat_ms,
+            "source_ts_ns": source_ts_ns,
+            "publish_ts_ns": publish_ts_ns,
+            "source_ts_iso": _iso_from_ns(source_ts_ns),
+            "publish_ts_iso": _iso_from_ns(publish_ts_ns),
+            "lat_source_ms": lat_source_ms,
+            "lat_publish_ms": lat_publish_ms,
+            # backward compat
+            "ts_ns": source_ts_ns,
+            "lat_ms": lat_source_ms,
         })
 
-    async def _h_dexswapl1(self, exchange: str, chain: str, pair: str, ds, ts_ns: int, lat_ms: Optional[float]):
+
+    async def _h_dexswapl1(
+        self,
+        exchange: str,
+        chain: str,
+        pair: str,
+        ds,
+        source_ts_ns: int,
+        publish_ts_ns: int,
+        lat_source_ms: Optional[float],
+        lat_publish_ms: Optional[float],
+    ):
         token0 = getattr(ds, "token0", "")
         token1 = getattr(ds, "token1", "")
         invert = bool(getattr(ds, "invert_for_quote", False))
@@ -586,16 +801,33 @@ class MarketDataClient:
                 price01=price01,
                 price10=price10,
                 invert_for_quote=invert,
-                ts_ns=ts_ns,
-                latency_ms=lat_ms
+                source_ts_ns=source_ts_ns,
+                publish_ts_ns=publish_ts_ns,
+                lat_source_ms=lat_source_ms,
+                lat_publish_ms=lat_publish_ms,
             )
 
         if self.enable_csv and self.csv_dir:
             await _csv_write(
                 os.path.join(self.csv_dir, "swaps.csv"),
-                ["timestamp", "exchange", "chain", "pair", "token0", "token1", "price", "price01", "price10", "invert_for_quote", "lat_ms"],
+                [
+                    "timestamp_source",
+                    "timestamp_publish",
+                    "exchange",
+                    "chain",
+                    "pair",
+                    "token0",
+                    "token1",
+                    "price",
+                    "price01",
+                    "price10",
+                    "invert_for_quote",
+                    "lat_source_ms",
+                    "lat_publish_ms",
+                ],
                 {
-                    "timestamp": _iso_from_ns(ts_ns),
+                    "timestamp_source": _iso_from_ns(source_ts_ns),
+                    "timestamp_publish": _iso_from_ns(publish_ts_ns),
                     "exchange": exchange,
                     "chain": chain,
                     "pair": pair,
@@ -605,8 +837,9 @@ class MarketDataClient:
                     "price01": price01,
                     "price10": price10,
                     "invert_for_quote": int(invert),
-                    "lat_ms": f"{lat_ms:.2f}" if lat_ms is not None else ""
-                }
+                    "lat_source_ms": f"{lat_source_ms:.2f}" if lat_source_ms is not None else "",
+                    "lat_publish_ms": f"{lat_publish_ms:.2f}" if lat_publish_ms is not None else "",
+                },
             )
 
         # 1) dexSwapL1 원본 이벤트
@@ -620,65 +853,96 @@ class MarketDataClient:
             "price01": price01,
             "price10": price10,
             "invert_for_quote": invert,
-            "ts_ns": ts_ns,
-            "lat_ms": lat_ms,
+            "source_ts_ns": source_ts_ns,
+            "publish_ts_ns": publish_ts_ns,
+            "source_ts_iso": _iso_from_ns(source_ts_ns),
+            "publish_ts_iso": _iso_from_ns(publish_ts_ns),
+            "lat_source_ms": lat_source_ms,
+            "lat_publish_ms": lat_publish_ms,
+            # backward compat
+            "ts_ns": source_ts_ns,
+            "lat_ms": lat_source_ms,
         })
 
-        # 2) swap 틱으로도 발행 (get_latest_price(...,"swap") 와 동일)
-        await self._emit({
-            "kind": "tick",
-            "exchange": exchange,
-            "symbol": pair,
-            "instrument": "swap",
-            "mid": price_qb,
-            "bid": price_qb,
-            "ask": price_qb,
-            "ts_ns": ts_ns,
-            "lat_ms": lat_ms,
-        })
 
-    async def _h_dex_as_tick(self, exchange: str, pair: str, ds, ts_ns: int, lat_ms: Optional[float]):
+    async def _h_dex_as_tick(
+        self,
+        exchange: str,
+        pair: str,
+        ds,
+        source_ts_ns: int,
+        publish_ts_ns: int,
+        lat_source_ms: Optional[float],
+        lat_publish_ms: Optional[float],
+    ):
         invert = bool(getattr(ds, "invert_for_quote", False))
         price01 = float(ds.price01)
         price10 = float(ds.price10)
         price_qb = price10 if invert else price01
 
-        # DEX는 bid/ask가 없으니 mid로 동일 세팅
+        # DEX는 bid/ask가 없으니 mid = price_qb 로 동일 세팅
         async with self._lock:
             self.ticks[(exchange, pair, "swap")] = Tick(
                 bid=price_qb,
                 ask=price_qb,
                 mid=price_qb,
-                ts_ns=ts_ns,
+                source_ts_ns=source_ts_ns,
+                publish_ts_ns=publish_ts_ns,
                 instrument="swap",
-                latency_ms=lat_ms
+                lat_source_ms=lat_source_ms,
+                lat_publish_ms=lat_publish_ms,
             )
 
-    async def _h_slippage(self, exchange: str, symbol: str, sl, ts_ns: int, lat_ms: Optional[float]):
+
+    async def _h_slippage(
+        self,
+        exchange: str,
+        symbol: str,
+        sl,
+        source_ts_ns: int,
+        publish_ts_ns: int,
+        lat_source_ms: Optional[float],
+        lat_publish_ms: Optional[float],
+    ):
         async with self._lock:
             self.slip[(exchange, symbol)] = Slippage(
-                sl.impact_bps01,
-                sl.impact_bps10,
-                sl.block_number,
-                sl.tx_hash,
-                ts_ns,
-                latency_ms=lat_ms
+                impact_bps01=sl.impact_bps01,
+                impact_bps10=sl.impact_bps10,
+                block_number=sl.block_number,
+                tx_hash=sl.tx_hash,
+                source_ts_ns=source_ts_ns,
+                publish_ts_ns=publish_ts_ns,
+                lat_source_ms=lat_source_ms,
+                lat_publish_ms=lat_publish_ms,
             )
 
         if self.enable_csv and self.csv_dir:
             await _csv_write(
                 os.path.join(self.csv_dir, "slippage.csv"),
-                ["timestamp", "exchange", "pair", "bps01", "bps10", "block", "tx", "lat_ms"],
+                [
+                    "timestamp_source",
+                    "timestamp_publish",
+                    "exchange",
+                    "pair",
+                    "bps01",
+                    "bps10",
+                    "block",
+                    "tx",
+                    "lat_source_ms",
+                    "lat_publish_ms",
+                ],
                 {
-                    "timestamp": _iso_from_ns(ts_ns),
+                    "timestamp_source": _iso_from_ns(source_ts_ns),
+                    "timestamp_publish": _iso_from_ns(publish_ts_ns),
                     "exchange": exchange,
                     "pair": symbol,
                     "bps01": f"{sl.impact_bps01:.8f}",
                     "bps10": f"{sl.impact_bps10:.8f}",
                     "block": sl.block_number,
                     "tx": sl.tx_hash,
-                    "lat_ms": f"{lat_ms:.2f}" if lat_ms is not None else ""
-                }
+                    "lat_source_ms": f"{lat_source_ms:.2f}" if lat_source_ms is not None else "",
+                    "lat_publish_ms": f"{lat_publish_ms:.2f}" if lat_publish_ms is not None else "",
+                },
             )
 
         await self._emit({
@@ -689,9 +953,18 @@ class MarketDataClient:
             "bps10": sl.impact_bps10,
             "block": sl.block_number,
             "tx": sl.tx_hash,
-            "ts_ns": ts_ns,
-            "lat_ms": lat_ms,
+            "source_ts_ns": source_ts_ns,
+            "publish_ts_ns": publish_ts_ns,
+            "source_ts_iso": _iso_from_ns(source_ts_ns),
+            "publish_ts_iso": _iso_from_ns(publish_ts_ns),
+            "lat_source_ms": lat_source_ms,
+            "lat_publish_ms": lat_publish_ms,
+            # backward compat
+            "ts_ns": source_ts_ns,
+            "lat_ms": lat_source_ms,
         })
+
+
 
     # --------------- simple query APIs ---------------
     async def get_latest_price(self, symbol: str, exchange: str, instrument: str = "spot") -> Optional[float]:
@@ -718,7 +991,10 @@ class MarketDataClient:
             "taker_rate": f.taker_rate,
             "maker_bps": f.maker_rate * 10000.0,
             "taker_bps": f.taker_rate * 10000.0,
-            "ts": f.ts_ns
+            "source_ts_ns": f.source_ts_ns,
+            "publish_ts_ns": f.publish_ts_ns,
+            "lat_source_ms": f.lat_source_ms,
+            "lat_publish_ms": f.lat_publish_ms,
         }
 
     async def get_volume(self, symbol: str, exchange: str, instrument: str) -> Optional[dict]:
@@ -733,7 +1009,10 @@ class MarketDataClient:
             "high": v.high,
             "low": v.low,
             "trades": v.trades,
-            "ts": v.ts_ns
+            "source_ts_ns": v.source_ts_ns,
+            "publish_ts_ns": v.publish_ts_ns,
+            "lat_source_ms": v.lat_source_ms,
+            "lat_publish_ms": v.lat_publish_ms,
         }
 
     async def get_slippage_latest(self, pair: str, exchange: str) -> Optional[dict]:
@@ -744,37 +1023,40 @@ class MarketDataClient:
         return {
             "bps01": s.impact_bps01,
             "bps10": s.impact_bps10,
-            "ts": s.ts_ns
+            "source_ts_ns": s.source_ts_ns,
+            "publish_ts_ns": s.publish_ts_ns,
+            "lat_source_ms": s.lat_source_ms,
+            "lat_publish_ms": s.lat_publish_ms,
         }
 
     async def get_latency_price(self, symbol: str, exchange: str, instrument: str) -> Optional[float]:
         sym = _norm_symbol(symbol)
         async with self._lock:
             t = self.ticks.get((exchange, sym, instrument.lower()))
-        return t.latency_ms if t else None
+        return t.lat_source_ms if t else None
 
     async def get_latency_funding(self, symbol: str, exchange: str) -> Optional[float]:
         sym = _norm_symbol(symbol)
         async with self._lock:
             f = self.funding.get((exchange, sym))
-        return f.latency_ms if f else None
+        return f.lat_source_ms if f else None
 
     async def get_latency_fee(self, symbol: str, exchange: str, instrument: str) -> Optional[float]:
         sym = _norm_symbol(symbol)
         async with self._lock:
             fa = self.fees.get((exchange, sym, instrument.lower()))
-        return fa.latency_ms if fa else None
+        return fa.lat_source_ms if fa else None
 
     async def get_latency_volume(self, symbol: str, exchange: str, instrument: str) -> Optional[float]:
         sym = _norm_symbol(symbol)
         async with self._lock:
             v = self.volume.get((exchange, sym, instrument.lower()))
-        return v.latency_ms if v else None
+        return v.lat_source_ms if v else None
 
     async def get_latency_slippage(self, pair: str, exchange: str) -> Optional[float]:
         async with self._lock:
             s = self.slip.get((exchange, pair))
-        return s.latency_ms if s else None
+        return s.lat_source_ms if s else None
 
     async def get_tick(self, symbol: str, exchange: str, instrument: str = "spot"):
         """(mid, ts, latency)을 같은 스냅샷으로 한번에 반환"""
@@ -811,7 +1093,7 @@ class MarketDataClient:
             s = self.slip.get(key)
             return None if not s else _dc_copy(s)
 
-    # 편의: 가격+지연을 한 번에
+
     async def get_latest_price_with_latency(self, symbol: str, exchange: str, instrument: str = "spot"):
         t = await self.get_tick(symbol, exchange, instrument)
         if not t:
@@ -820,13 +1102,17 @@ class MarketDataClient:
             "mid": t.mid,
             "bid": t.bid,
             "ask": t.ask,
-            "lat_ms": t.latency_ms,
-            "ts_ns": t.ts_ns,
-            "ts_iso": _iso_from_ns(t.ts_ns),
+            "source_ts_ns": t.source_ts_ns,
+            "publish_ts_ns": t.publish_ts_ns,
+            "source_ts_iso": _iso_from_ns(t.source_ts_ns),
+            "publish_ts_iso": _iso_from_ns(t.publish_ts_ns),
+            "lat_source_ms": t.lat_source_ms,
+            "lat_publish_ms": t.lat_publish_ms,
             "instrument": t.instrument,
             "exchange": exchange,
             "symbol": _norm_symbol(symbol),
         }
+
 
     async def get_dex_price_qb(self, pair: str, exchange: str, chain: str = "BSC"):
         key = (exchange, chain, pair)
@@ -837,10 +1123,14 @@ class MarketDataClient:
             price_qb = dp.price10 if dp.invert_for_quote else dp.price01
             return {
                 "price_qb": price_qb,
-                "ts_ns": dp.ts_ns,
-                "ts_iso": _iso_from_ns(dp.ts_ns),
-                "lat_ms": dp.latency_ms
+                "source_ts_ns": dp.source_ts_ns,
+                "publish_ts_ns": dp.publish_ts_ns,
+                "source_ts_iso": _iso_from_ns(dp.source_ts_ns),
+                "publish_ts_iso": _iso_from_ns(dp.publish_ts_ns),
+                "lat_source_ms": dp.lat_source_ms,
+                "lat_publish_ms": dp.lat_publish_ms,
             }
+
 
 # ========================= helper builders =========================
 def _dc_copy(obj):
