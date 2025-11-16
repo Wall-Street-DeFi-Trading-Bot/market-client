@@ -1,8 +1,4 @@
-// marketdata_v2.proto
 syntax = "proto3";
-
-package md;
-option go_package = "github.com/sujine/market-fetcher/proto/md";
 
 // ---- Enums ----
 enum Venue {
@@ -36,17 +32,17 @@ message Header {
   Venue venue = 3;
   Instrument instrument = 4;
 
-  // Monotonic-ish, event emission time in ns (UTC).
-  int64 ts_ns = 5;
+  int64 source_ts_ns = 5;
+  int64 publish_ts_ns = 6;
 
   // Schema version for the event family (bump when breaking).
-  uint32 schema_version = 6;
+  uint32 schema_version = 7;
 
   // Optional chain context for DEX (e.g., "BSC"), else empty.
-  string chain = 7;
+  string chain = 8;
 
   // Optional: raw pool address for DEX tick source.
-  string pool_address = 8;
+  string pool_address = 9;
 }
 
 // ---- Normalized events ----
@@ -76,19 +72,18 @@ message DexSwapL1 {
   string tx_hash = 21;                // transaction hash (0x…)
   uint64 log_index = 22;              // log index within the tx
   uint64 block_number = 23;           // block number
-  uint64 timestamp = 24;              // unix seconds
 
   // --- Token metadata (to compute human price) ---
-  string token0 = 30;                 // symbol
-  string token1 = 31;                 // symbol
-  uint32 token0_decimals = 32;        // e.g., 18
-  uint32 token1_decimals = 33;        // e.g., 18
+  string token0 = 24;                 // symbol
+  string token1 = 25;                 // symbol
+  uint32 token0_decimals = 26;        // e.g., 18
+  uint32 token1_decimals = 27;        // e.g., 18
 
   // --- Orientation & computed prices ---
   // price01 = token1/token0 (pool-native). price_qb = quote/base as requested by the symbol.
-  bool invert_for_quote = 40;         // true if we inverted price01 to form quote/base
-  double price01 = 41;                  // price = (sqrtP/2^96)^2 * 10^(dec0-dec1)
-  double price10 = 42;               // price after invert if needed (what you publish as “mid”)
+  bool invert_for_quote = 28;         // true if we inverted price01 to form quote/base
+  double price01 = 29;                  // price = (sqrtP/2^96)^2 * 10^(dec0-dec1)
+  double price10 = 30;               // price after invert if needed (what you publish as “mid”)
 }
 
 message Slippage {
@@ -96,7 +91,6 @@ message Slippage {
   double impact_bps10 = 2; 
   uint64 block_number = 3;   
   string tx_hash = 4;    
-  uint64 timestamp = 5;  
 }
 
 message Volume {

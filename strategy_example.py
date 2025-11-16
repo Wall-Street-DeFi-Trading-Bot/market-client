@@ -1,7 +1,8 @@
-# example_queries_with_latency.py
 import asyncio
 from market_data_client import make_client_simple, _iso_from_ns
-import json
+
+def ms(v: float) -> str:
+    return f"{v:.2f} ms" if v is not None else "n/a"
 
 async def main():
     client = make_client_simple(
@@ -9,7 +10,7 @@ async def main():
         use_jetstream=False,
         cex_exchange="Binance",
         cex_instruments=["spot","perpetual"],
-        cex_symbols=["ETHUSDT"],
+        cex_symbols=["BNBUSDT"],
         dex_exchange="PancakeSwapV2",
         dex_chain="BSC",
         dex_pairs=["WBNBUSDT"],
@@ -17,14 +18,15 @@ async def main():
     await client.start()
     print("✅ ready")
     await asyncio.sleep(3)
+
     # ----- Binance  -----
-    t_spot = await client.get_latest_price_with_latency("ETHUSDT", "Binance", "spot")
-    t_perp = await client.get_latest_price_with_latency("ETHUSDT", "Binance", "perpetual")
-    f_meta = await client.get_funding_meta("ETHUSDT", "Binance")
-    v_spot = await client.get_volume_meta("ETHUSDT", "Binance", "spot")
-    v_perp = await client.get_volume_meta("ETHUSDT", "Binance", "perpetual")
-    fee_sp  = await client.get_fee_meta("ETHUSDT", "Binance", "spot")
-    fee_pp  = await client.get_fee_meta("ETHUSDT", "Binance", "perpetual")
+    t_spot = await client.get_latest_price_with_latency("BNBUSDT", "Binance", "spot")
+    t_perp = await client.get_latest_price_with_latency("BNBUSDT", "Binance", "perpetual")
+    f_meta = await client.get_funding_meta("BNBUSDT", "Binance")
+    v_spot = await client.get_volume_meta("BNBUSDT", "Binance", "spot")
+    v_perp = await client.get_volume_meta("BNBUSDT", "Binance", "perpetual")
+    fee_sp  = await client.get_fee_meta("BNBUSDT", "Binance", "spot")
+    fee_pp  = await client.get_fee_meta("BNBUSDT", "Binance", "perpetual")
 
     # ----- PancakeSwapV2  -----
     dex_price  = await client.get_dex_price_qb("WBNBUSDT", "PancakeSwapV2")
@@ -35,24 +37,46 @@ async def main():
     # ----- 출력 -----
     print("\n--- Binance ---")
     if t_spot:
-        print(f"Spot mid     : {t_spot['mid']} (lat={t_spot['lat_ms']:.2f} ms @ {t_spot['ts_iso']})")
+        print(
+            f"Spot mid     : {t_spot['mid']} "
+            f"(src={t_spot['source_ts_iso']} pub={t_spot['publish_ts_iso']} "
+            f"lat_src={ms(t_spot['lat_source_ms'])} lat_pub={ms(t_spot['lat_publish_ms'])})"
+        )
     else:
         print("Spot mid     : None")
+
     if t_perp:
-        print(f"Perp mid     : {t_perp['mid']} (lat={t_perp['lat_ms']:.2f} ms @ {t_perp['ts_iso']})")
+        print(
+            f"Perp mid     : {t_perp['mid']} "
+            f"(src={t_perp['source_ts_iso']} pub={t_perp['publish_ts_iso']} "
+            f"lat_src={ms(t_perp['lat_source_ms'])} lat_pub={ms(t_perp['lat_publish_ms'])})"
+        )
     else:
         print("Perp mid     : None")
+
     if f_meta:
-        print(f"Funding rate : {f_meta.funding_rate} (next={_iso_from_ns(f_meta.next_funding_time_ms*1_000_000)} lat={f_meta.latency_ms:.2f} ms)")
+        print(
+            f"Funding rate : {f_meta.funding_rate} "
+            f"(next={_iso_from_ns(f_meta.next_funding_time_ms * 1_000_000)} "
+            f"lat_src={ms(f_meta.lat_source_ms)} lat_pub={ms(f_meta.lat_publish_ms)})"
+        )
     else:
         print("Funding rate : None")
+
     print(f"Volume spot  : {vars(v_spot) if v_spot else None}")
     print(f"Volume perp  : {vars(v_perp) if v_perp else None}")
     print(f"Fee spot     : {vars(fee_sp) if fee_sp else None}")
     print(f"Fee perp     : {vars(fee_pp) if fee_pp else None}")
 
     print("\n--- PancakeSwapV2 (BSC) ---")
-    print("Price (WBNBUSDT):", dex_price["price_qb"])
+    if dex_price:
+        print(
+            f"Price (WBNBUSDT): {dex_price['price_qb']} "
+            f"(src={dex_price['source_ts_iso']} pub={dex_price['publish_ts_iso']} "
+            f"lat_src={ms(dex_price['lat_source_ms'])} lat_pub={ms(dex_price['lat_publish_ms'])})"
+        )
+    else:
+        print("Price (WBNBUSDT): None")
     print(f"Volume (WBNBUSDT): {vars(dex_vol) if dex_vol else None}")
     print(f"Fee    (WBNBUSDT): {vars(dex_fee) if dex_fee else None}")
     print(f"Slip   (WBNBUSDT): {vars(dex_slip) if dex_slip else None}")
