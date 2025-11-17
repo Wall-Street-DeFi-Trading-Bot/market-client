@@ -15,8 +15,8 @@ async def main():
             want=("tick","funding","fee","volume"),
         )],
         dex=[
-            DexConfig(exchange="PancakeSwapV2", chain="BSC", pairs=["USDTWBNB","CAKEUSDT","CAKEWBNB","TWTWBNB","USDTWBNB","USDTBTCB","SFPWBNB"]),
-            DexConfig(exchange="PancakeSwapV3", chain="BSC", pairs=["USDTWBNB","CAKEUSDT","CAKEWBNB","TWTWBNB","USDTWBNB","USDTBTCB","SFPWBNB"]),
+            DexConfig(exchange="PancakeSwapV2", chain="BSC", pairs=["USDTWBNB","CAKEUSDT","CAKEWBNB","TWTWBNB","USDTBTCB","SFPWBNB"]),
+            DexConfig(exchange="PancakeSwapV3", chain="BSC", pairs=["USDTWBNB","CAKEUSDT","CAKEWBNB","TWTWBNB","USDTBTCB","SFPWBNB"]),
         ],
     )
     await client.start()
