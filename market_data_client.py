@@ -503,8 +503,9 @@ class MarketDataClient:
             )
 
         if self.enable_csv and self.csv_dir:
+            path = os.path.join(self.csv_dir, exchange, norm_sym, "ticks.csv")
             await _csv_write(
-                os.path.join(self.csv_dir, "ticks.csv"),
+                path,
                 [
                     "timestamp_source",
                     "timestamp_publish",
@@ -575,7 +576,9 @@ class MarketDataClient:
             )
 
         if self.enable_csv and self.csv_dir:
+            path = os.path.join(self.csv_dir, exchange, norm_sym, "funding.csv")
             await _csv_write(
+                path,
                 os.path.join(self.csv_dir, "funding.csv"),
                 [
                     "timestamp_source",
@@ -647,8 +650,9 @@ class MarketDataClient:
             )
 
         if self.enable_csv and self.csv_dir:
+            path = os.path.join(self.csv_dir, exchange, norm_sym, "fees.csv")
             await _csv_write(
-                os.path.join(self.csv_dir, "fees.csv"),
+                path,
                 [
                     "timestamp_source",
                     "timestamp_publish",
@@ -719,8 +723,9 @@ class MarketDataClient:
             )
 
         if self.enable_csv and self.csv_dir:
+            path = os.path.join(self.csv_dir, exchange, norm_sym, "volume.csv")
             await _csv_write(
-                os.path.join(self.csv_dir, "volume.csv"),
+                path,
                 [
                     "timestamp_source",
                     "timestamp_publish",
@@ -808,8 +813,9 @@ class MarketDataClient:
             )
 
         if self.enable_csv and self.csv_dir:
+            path = os.path.join(self.csv_dir, exchange, pair, "swaps.csv")
             await _csv_write(
-                os.path.join(self.csv_dir, "swaps.csv"),
+                path,
                 [
                     "timestamp_source",
                     "timestamp_publish",
@@ -917,8 +923,9 @@ class MarketDataClient:
             )
 
         if self.enable_csv and self.csv_dir:
+            path = os.path.join(self.csv_dir, exchange, symbol, "slippage.csv")
             await _csv_write(
-                os.path.join(self.csv_dir, "slippage.csv"),
+                path,
                 [
                     "timestamp_source",
                     "timestamp_publish",
