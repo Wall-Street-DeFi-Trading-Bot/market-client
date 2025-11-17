@@ -579,7 +579,6 @@ class MarketDataClient:
             path = os.path.join(self.csv_dir, exchange, norm_sym, "funding.csv")
             await _csv_write(
                 path,
-                os.path.join(self.csv_dir, "funding.csv"),
                 [
                     "timestamp_source",
                     "timestamp_publish",

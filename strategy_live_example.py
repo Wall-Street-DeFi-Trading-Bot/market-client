@@ -10,7 +10,7 @@ async def main():
         enable_csv=True,
         cex=[CexConfig(
             exchange="Binance",
-            symbols=["BNBUSDT"],
+            symbols=["BNBUSDT","BTCUSDT","CAKEUSDT","TWTUSDT","SFPUSDT"],
             instruments=["spot", "perpetual"],
             want=("tick","funding","fee","volume"),
         )],
