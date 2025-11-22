@@ -1,2 +1,6 @@
 nats-py>=2.6.0
 protobuf>=4.25.0
+ccxt>=4.0.0
+web3>=6.0.0
+python-dotenv>=1.0.0 
+
