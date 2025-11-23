@@ -15,7 +15,7 @@ from nats.aio.client import Client as NATS
 from nats.js import api as jsapi
 from nats.js.errors import NotFoundError
 
-import proto.market_pb2 as pb
+from .proto import market_pb2 as pb
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)

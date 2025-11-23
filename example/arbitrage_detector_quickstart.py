@@ -7,7 +7,7 @@ Modify the configuration below to match your needs.
 
 import asyncio
 
-from arbitrage_detector import run_arbitrage_detector
+from market_data_client.arbitrage.arbitrage_detector import run_arbitrage_detector
 
 
 async def main():
@@ -49,13 +49,13 @@ async def main():
     print("\nPress Ctrl+C to stop\n")
     
     # Optional: Map CEX symbols to DEX pair names
-    # This allows you to use "ETHUSDT" for CEX but "WBNBUSDT" for DEX
+    # This allows you to use "ETHUSDT" for CEX but "USDTWBNB" for DEX
     # Check CSV files (./csv/swaps.csv) to see what pairs are actually available
     SYMBOL_MAPPING = {
         # Uncomment and adjust based on your actual DEX pairs:
         "BNBUSDT": {
-            "PancakeSwapV2": "WBNBUSDT",  # Use WBNBUSDT on PancakeSwapV2
-            "PancakeSwapV3": "WBNBUSDT",  # Use WBNBUSDT on PancakeSwapV3
+            "PancakeSwapV2": "USDTWBNB",  # Use USDTWBNB on PancakeSwapV2
+            "PancakeSwapV3": "USDTWBNB",  # Use USDTWBNB on PancakeSwapV3
         },
     }
     

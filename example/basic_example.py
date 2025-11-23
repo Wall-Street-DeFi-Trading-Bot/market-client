@@ -1,5 +1,5 @@
 import asyncio
-from market_data_client import make_client_simple, _iso_from_ns
+from market_data_client.market_data_client import make_client_simple, _iso_from_ns
 
 def ms(v: float) -> str:
     return f"{v:.2f} ms" if v is not None else "n/a"
@@ -11,9 +11,9 @@ async def main():
         cex_exchange="Binance",
         cex_instruments=["spot","perpetual"],
         cex_symbols=["BNBUSDT"],
-        dex_exchange="PancakeSwapV2",
+        dex_exchange="PancakeSwapV3",
         dex_chain="BSC",
-        dex_pairs=["WBNBUSDT"],
+        dex_pairs=["USDTWBNB"],
     )
     await client.start()
     print("✅ ready")
@@ -28,11 +28,11 @@ async def main():
     fee_sp  = await client.get_fee_meta("BNBUSDT", "Binance", "spot")
     fee_pp  = await client.get_fee_meta("BNBUSDT", "Binance", "perpetual")
 
-    # ----- PancakeSwapV2  -----
-    dex_price  = await client.get_dex_price_qb("WBNBUSDT", "PancakeSwapV2")
-    dex_vol    = await client.get_volume_meta("WBNBUSDT", "PancakeSwapV2", "swap")
-    dex_fee    = await client.get_fee_meta("WBNBUSDT", "PancakeSwapV2", "swap")
-    dex_slip   = await client.get_slippage_meta("WBNBUSDT", "PancakeSwapV2")
+    # ----- PancakeSwapV3  -----
+    dex_price  = await client.get_dex_price_qb("USDTWBNB", "PancakeSwapV3")
+    dex_vol    = await client.get_volume_meta("USDTWBNB", "PancakeSwapV3", "swap")
+    dex_fee    = await client.get_fee_meta("USDTWBNB", "PancakeSwapV3", "swap")
+    dex_slip   = await client.get_slippage_meta("USDTWBNB", "PancakeSwapV3")
 
     # ----- 출력 -----
     print("\n--- Binance ---")
@@ -68,18 +68,18 @@ async def main():
     print(f"Fee spot     : {vars(fee_sp) if fee_sp else None}")
     print(f"Fee perp     : {vars(fee_pp) if fee_pp else None}")
 
-    print("\n--- PancakeSwapV2 (BSC) ---")
+    print("\n--- PancakeSwapV3 (BSC) ---")
     if dex_price:
         print(
-            f"Price (WBNBUSDT): {dex_price['price_qb']} "
+            f"Price (USDTWBNB): {dex_price['price_qb']} "
             f"(src={dex_price['source_ts_iso']} pub={dex_price['publish_ts_iso']} "
             f"lat_src={ms(dex_price['lat_source_ms'])} lat_pub={ms(dex_price['lat_publish_ms'])})"
         )
     else:
-        print("Price (WBNBUSDT): None")
-    print(f"Volume (WBNBUSDT): {vars(dex_vol) if dex_vol else None}")
-    print(f"Fee    (WBNBUSDT): {vars(dex_fee) if dex_fee else None}")
-    print(f"Slip   (WBNBUSDT): {vars(dex_slip) if dex_slip else None}")
+        print("Price (USDTWBNB): None")
+    print(f"Volume (USDTWBNB): {vars(dex_vol) if dex_vol else None}")
+    print(f"Fee    (USDTWBNB): {vars(dex_fee) if dex_fee else None}")
+    print(f"Slip   (USDTWBNB): {vars(dex_slip) if dex_slip else None}")
 
     await client.stop()
 
