@@ -30,19 +30,19 @@ async def main() -> None:
     paper_initial_balances = {
         ("Binance", "spot"): {
             "USDT": 10_000.0,
-            "BNB": 0.0,
+            "BNB": 100.0,
         },
         ("Binance", "perpetual"): {
             "USDT": 10_000.0,
-            "BNB": 0.0,
+            "BNB": 100.0,
         },
         ("PancakeSwapV2", "swap"): {
             "USDT": 10_000.0,
-            "BNB": 10,
+            "BNB": 100.0,
         },
         ("PancakeSwapV3", "swap"): {
             "USDT": 10_000.0,
-            "BNB": 10,
+            "BNB": 100.0,
         },
     }
 

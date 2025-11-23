@@ -260,6 +260,9 @@ async def run_arbitrage_bot(
 
                     try:
                         await executor.execute_opportunity(opp)
+                    except ValueError as e:
+                        logger.info("[BOT] Execution failed for %s: %s", opp.symbol, e)
+                        continue
                     except Exception as exc:
                         logger.warning(f"[BOT] Failed to execute opportunity: {exc}")
                         continue

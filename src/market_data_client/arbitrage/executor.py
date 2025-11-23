@@ -111,6 +111,16 @@ class TradeExecutor:
             )
             raise ValueError("BUY leg failed (ok == False)")
 
+        if hasattr(buy_trade, "success") and not getattr(buy_trade, "success"):
+            logger.warning(
+                "[EXECUTOR] BUY leg failed for %s on %s(%s): %s",
+                opp.symbol,
+                opp.buy_exchange,
+                opp.buy_instrument,
+                getattr(buy_trade, "message", "success == False"),
+            )
+            raise ValueError("BUY leg failed (success == False)")
+    
         # 4) SELL leg
         try:
             sell_trade = await sell_client.create_market_order(
@@ -144,6 +154,16 @@ class TradeExecutor:
             )
             raise ValueError("SELL leg failed (ok == False)")
 
+        if hasattr(sell_trade, "success") and not getattr(sell_trade, "success"):
+            logger.warning(
+                "[EXECUTOR] SELL leg failed for %s on %s(%s): %s",
+                opp.symbol,
+                opp.sell_exchange,
+                opp.sell_instrument,
+                getattr(sell_trade, "message", "success == False"),
+            )
+            raise ValueError("SELL leg failed (success == False)")
+        
         # 5) Both legs succeeded: log and return
         logger.info(
             f"[EXECUTOR] Done: buy @ {buy_trade.price:.4f} on {buy_trade.exchange}, "

@@ -14,8 +14,15 @@ if TYPE_CHECKING:
     from .state import BotState
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+    logger.addHandler(handler)
 class OrderSide(str, Enum):
     """Order direction."""
     BUY = "BUY"
@@ -85,6 +92,7 @@ class ExchangeClient(abc.ABC):
         quantity: float,
         price: Optional[float] = None,
         order_type: OrderType = OrderType.MARKET,
+        fee_rate: Optional[float] = None,
     ) -> TradeResult:
         """
         Create an order on the exchange.
@@ -102,6 +110,7 @@ class ExchangeClient(abc.ABC):
         *,
         price: Optional[float] = None,
         price_hint: Optional[float] = None,
+        fee_rate: Optional[float] = None,
         quote_asset: str = "USDT",
         **_: object,
     ) -> TradeResult:
@@ -130,6 +139,7 @@ class ExchangeClient(abc.ABC):
             quantity=quantity,
             price=eff_price,
             order_type=OrderType.MARKET,
+            fee_rate=fee_rate,
         )
 
 
@@ -152,7 +162,6 @@ class PaperExchangeClient(ExchangeClient):
         super().__init__(name=name, instrument=instrument, mode=ExecutionMode.PAPER)
         self._state = state
         self._fee_rate = fee_rate
-
 
     def _split_symbol(self, symbol: str) -> tuple[str, str]:
         """
@@ -180,6 +189,7 @@ class PaperExchangeClient(ExchangeClient):
         quantity: float,
         price: Optional[float] = None,
         order_type: OrderType = OrderType.MARKET,
+        fee_rate: Optional[float] = None,
     ) -> TradeResult:
         """
         Simulate an order on a paper account.
@@ -238,7 +248,18 @@ class PaperExchangeClient(ExchangeClient):
         account = self._state.get_or_create_account(self.name, self.instrument)
 
         notional = quantity * price
-        fee = notional * self._fee_rate
+
+        # Choose effective fee rate:
+        # - If fee_rate is provided by the executor (from detector), use it.
+        # - Otherwise, fall back to the client's default _fee_rate.
+        try:
+            eff_fee_rate = float(fee_rate) if fee_rate is not None else self._fee_rate
+        except (TypeError, ValueError):
+            eff_fee_rate = self._fee_rate
+        if eff_fee_rate < 0.0:
+            eff_fee_rate = 0.0
+
+        fee = notional * eff_fee_rate
 
         base_delta = 0.0
         quote_delta = 0.0
@@ -362,6 +383,7 @@ class PaperExchangeClient(ExchangeClient):
 
         return result
 
+
 class BinanceExchangeClient(ExchangeClient):
     """
     Skeleton for real Binance client.
@@ -384,6 +406,7 @@ class BinanceExchangeClient(ExchangeClient):
         quantity: float,
         price: Optional[float] = None,
         order_type: OrderType = OrderType.MARKET,
+        fee_rate: Optional[float] = None,
     ) -> TradeResult:
         raise NotImplementedError("BinanceExchangeClient.create_order is not implemented yet")
 
@@ -410,5 +433,6 @@ class PancakeSwapExchangeClient(ExchangeClient):
         quantity: float,
         price: Optional[float] = None,
         order_type: OrderType = OrderType.MARKET,
+        fee_rate: Optional[float] = None,
     ) -> TradeResult:
         raise NotImplementedError("PancakeSwapExchangeClient.create_order is not implemented yet")
