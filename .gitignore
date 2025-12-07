@@ -6,11 +6,15 @@ dist/
 build/
 nats-data/
 market_logs/
+node_modules/
 *.csv
+
+.hypothesis/
 
 # Virtual environments
 .venv/
-.env/
+.env
+
 
 # Mac metadata
 .DS_Store
