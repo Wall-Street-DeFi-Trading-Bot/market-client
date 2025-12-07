@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Move to project root directory (from tests/scripts -> project root)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${SCRIPT_DIR}/../.."
+cd "$ROOT_DIR"
+
+# Default environment values for Pancake demo.
+# You can override any of these by exporting them before running this script.
+export DEMO_PANCAKE_FORK_RPC_URL="${DEMO_PANCAKE_FORK_RPC_URL:-http://127.0.0.1:8545}"
+export DEMO_PANCAKE_UPSTREAM_RPC_URL="${DEMO_PANCAKE_UPSTREAM_RPC_URL:-https://bsc-dataseed.binance.org}"
+
+export DEMO_PANCAKE_ROUTER_ADDRESS="${DEMO_PANCAKE_ROUTER_ADDRESS:-0xd9C500DfF816a1Da21A48A732d3498Bf09dc9AEB}"
+export DEMO_PANCAKE_ROUTER_ABI_JSON="${DEMO_PANCAKE_ROUTER_ABI_JSON:-contracts/abi/UniversalRouter.json}"
+export DEMO_PANCAKE_SWAP_PATH="${DEMO_PANCAKE_SWAP_PATH:-WBNB,USDT}"
+export DEMO_PANCAKE_TRADER_PRIVATE_KEY="${DEMO_PANCAKE_TRADER_PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
+export DEMO_PANCAKE_PERMIT2_ADDRESS="${DEMO_PANCAKE_PERMIT2_ADDRESS:-0x31c2F6fcFf4F8759b3Bd5Bf0e1084A055615c768}"
+# export DEMO_PANCAKE_TRADER_ADDRESS="${DEMO_PANCAKE_TRADER_ADDRESS:-0x0523914232aC5947390c4806241404C36d215f27}"
+
+# Optional: choose fork engine ("anvil" or "hardhat")
+export DEMO_PANCAKE_FORK_ENGINE="${DEMO_PANCAKE_FORK_ENGINE:-anvil}"
+export DEMO_PANCAKE_TEST_FUND=1
+export DEMO_PANCAKE_AUTO_APPROVE=1
+
+echo "[Pancake demo test runner]"
+echo "  ROOT_DIR                        = $ROOT_DIR"
+echo "  DEMO_PANCAKE_FORK_RPC_URL       = $DEMO_PANCAKE_FORK_RPC_URL"
+echo "  DEMO_PANCAKE_UPSTREAM_RPC_URL   = $DEMO_PANCAKE_UPSTREAM_RPC_URL"
+echo "  DEMO_PANCAKE_ROUTER_ADDRESS     = $DEMO_PANCAKE_ROUTER_ADDRESS"
+echo "  DEMO_PANCAKE_ROUTER_ABI_JSON    = $DEMO_PANCAKE_ROUTER_ABI_JSON"
+echo "  DEMO_PANCAKE_SWAP_PATH          = $DEMO_PANCAKE_SWAP_PATH"
+# echo "  DEMO_PANCAKE_TRADER_ADDRESS = $DEMO_PANCAKE_TRADER_ADDRESS"
+echo "  DEMO_PANCAKE_FORK_ENGINE        = $DEMO_PANCAKE_FORK_ENGINE"
+echo "  DEMO_PANCAKE_PERMIT2_ADDRESS    = $DEMO_PANCAKE_PERMIT2_ADDRESS"
+echo "  DEMO_PANCAKE_TRADER_PRIVATE_KEY = $DEMO_PANCAKE_TRADER_PRIVATE_KEY"
+
+python3 -m pytest -s -rs tests/test_pancake_demo_real_fork.py
