@@ -1,7 +1,7 @@
-# src/market_data_client/arbitrage/excutor.py
+# src/market_data_client/arbitrage/executor.py
 """
 TradeExecutor: takes ArbitrageOpportunity objects and sends orders
-through ExchangeClient implementations (LIVE or PAPER).
+through ExchangeClient implementations (LIVE / PAPER / DEMO).
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import logging
 from typing import Dict, Tuple
 
 from .arbitrage_detector import ArbitrageOpportunity
-from .exchange import ExchangeClient, TradeResult
+from .exchange import ExchangeClient, TradeResult, OrderSide
 from .risk import RiskManager
 
 logger = logging.getLogger(__name__)
@@ -18,96 +18,116 @@ logger = logging.getLogger(__name__)
 
 class TradeExecutor:
     """
-    Executes arbitrage trades given detected opportunities.
+    TradeExecutor wires ArbitrageOpportunity objects to concrete ExchangeClient
+    implementations and runs a simple two-leg arbitrage (BUY then SELL).
 
-    It expects a mapping:
-        key: (exchange_name, instrument)
-        value: ExchangeClient instance (live or paper)
+    This class does not perform any scheduling or opportunity search.
+    It only executes a single opportunity when asked.
     """
 
     def __init__(
         self,
         exchange_clients: Dict[Tuple[str, str], ExchangeClient],
         risk_manager: RiskManager,
-    ):
-        self.exchange_clients = exchange_clients
-        self.risk = risk_manager
-
-    def _get_client(self, exchange: str, instrument: str) -> ExchangeClient:
-        key = (exchange, instrument)
-        if key not in self.exchange_clients:
-            raise KeyError(f"No ExchangeClient registered for {exchange}({instrument})")
-        return self.exchange_clients[key]
-
-    async def execute_opportunity(self, opp: ArbitrageOpportunity) -> Tuple[TradeResult, TradeResult]:
+    ) -> None:
         """
-        Execute a single arbitrage: buy on buy_exchange, sell on sell_exchange.
-
-        Returns:
-            (buy_trade_result, sell_trade_result)
-
-        Error handling:
-          - If the opportunity is rejected by RiskManager, raises ValueError.
-          - If BUY leg fails (no result / error flag), raises ValueError.
-          - If SELL leg fails (no result / error flag), raises ValueError.
-          In all failure cases this method returns early and the caller
-          must treat the whole arbitrage as "not executed".
+        Args:
+            exchange_clients: Mapping (exchange, instrument) -> ExchangeClient.
+            risk_manager: RiskManager instance used for sizing and filtering.
         """
-        # 1) Risk check
-        if not self.risk.is_acceptable(opp):
+        self._clients = exchange_clients
+        self._risk = risk_manager
+
+    async def execute_opportunity(
+        self,
+        opp: ArbitrageOpportunity,
+    ) -> Tuple[TradeResult, TradeResult]:
+        """
+        Execute a single arbitrage opportunity.
+
+        Flow:
+            1) Ask risk manager if the opportunity is acceptable.
+            2) Compute trade quantity via risk manager.
+            3) Execute BUY leg on (buy_exchange, buy_instrument).
+            4) Execute SELL leg on (sell_exchange, sell_instrument).
+
+        Raises:
+            ValueError: if the opportunity is rejected, sizing is invalid,
+                        required clients are missing, or any leg fails.
+        """
+        if not self._risk.is_acceptable(opp):
             logger.info(
-                f"[EXECUTOR] Skipping opportunity {opp.symbol}: net={opp.net_profit_pct:.3f}% "
-                f"below risk threshold."
+                "[EXECUTOR] Opportunity rejected by risk manager: "
+                "%s(%s) -> %s(%s)",
+                opp.buy_exchange,
+                opp.buy_instrument,
+                opp.sell_exchange,
+                opp.sell_instrument,
             )
             raise ValueError("Opportunity rejected by risk manager")
 
-        # 2) Compute quantity in base asset
-        qty = self.risk.compute_trade_quantity(opp)
+        qty = self._risk.compute_trade_quantity(opp)
         if qty <= 0:
-            logger.info(
-                f"[EXECUTOR] Computed quantity is 0 for {opp.symbol}, skipping."
-            )
-            raise ValueError("Computed trade quantity <= 0")
+            raise ValueError("Risk manager returned non-positive trade size")
+
+        buy_key = (opp.buy_exchange, opp.buy_instrument)
+        sell_key = (opp.sell_exchange, opp.sell_instrument)
+
+        buy_client = self._clients.get(buy_key)
+        sell_client = self._clients.get(sell_key)
+
+        if buy_client is None:
+            raise ValueError(f"No exchange client configured for {buy_key}")
+        if sell_client is None:
+            raise ValueError(f"No exchange client configured for {sell_key}")
 
         logger.info(
-            f"[EXECUTOR] Executing arbitrage on {opp.symbol}: "
-            f"qty={qty:.6f}, net={opp.net_profit_pct:.3f}% "
-            f"{opp.buy_exchange}({opp.buy_instrument}) -> "
-            f"{opp.sell_exchange}({opp.sell_instrument})"
+            "[EXECUTOR] Executing arbitrage: %s | buy on %s(%s) @ %.4f, "
+            "sell on %s(%s) @ %.4f, qty=%.6f",
+            opp.symbol,
+            opp.buy_exchange,
+            opp.buy_instrument,
+            opp.buy_price,
+            opp.sell_exchange,
+            opp.sell_instrument,
+            opp.sell_price,
+            qty,
         )
 
-        buy_client = self._get_client(opp.buy_exchange, opp.buy_instrument)
-        sell_client = self._get_client(opp.sell_exchange, opp.sell_instrument)
-
-        # 3) BUY leg
+        # BUY leg
         try:
             buy_trade = await buy_client.create_market_order(
                 symbol=opp.symbol,
-                side="buy",
+                side=OrderSide.BUY,
                 quantity=qty,
-                price_hint=opp.buy_price,
-                fee_rate=opp.buy_fee,
+                price=opp.buy_price,
             )
-        except Exception as exc:
+        except Exception as exc:  # defensive
             logger.warning(
-                f"[EXECUTOR] BUY leg exception for {opp.symbol} on "
-                f"{opp.buy_exchange}({opp.buy_instrument}): {exc}"
+                "[EXECUTOR] BUY leg exception for %s on %s(%s): %s",
+                opp.symbol,
+                opp.buy_exchange,
+                opp.buy_instrument,
+                exc,
             )
             raise ValueError("BUY leg failed with exception") from exc
 
-        # Treat None / False / ok=False as failure
         if not buy_trade:
             logger.warning(
-                f"[EXECUTOR] BUY leg failed for {opp.symbol} on "
-                f"{opp.buy_exchange}({opp.buy_instrument}): no trade result returned"
+                "[EXECUTOR] BUY leg failed for %s on %s(%s): no trade result",
+                opp.symbol,
+                opp.buy_exchange,
+                opp.buy_instrument,
             )
             raise ValueError("BUY leg failed (no trade result)")
 
         if hasattr(buy_trade, "ok") and not getattr(buy_trade, "ok"):
             logger.warning(
-                f"[EXECUTOR] BUY leg failed for {opp.symbol} on "
-                f"{opp.buy_exchange}({opp.buy_instrument}): "
-                f"{getattr(buy_trade, 'error', 'ok == False')}"
+                "[EXECUTOR] BUY leg failed for %s on %s(%s): %s",
+                opp.symbol,
+                opp.buy_exchange,
+                opp.buy_instrument,
+                getattr(buy_trade, "error", "ok == False"),
             )
             raise ValueError("BUY leg failed (ok == False)")
 
@@ -120,37 +140,41 @@ class TradeExecutor:
                 getattr(buy_trade, "message", "success == False"),
             )
             raise ValueError("BUY leg failed (success == False)")
-    
-        # 4) SELL leg
+
+        # SELL leg
         try:
             sell_trade = await sell_client.create_market_order(
                 symbol=opp.symbol,
-                side="sell",
+                side=OrderSide.SELL,
                 quantity=qty,
-                price_hint=opp.sell_price,
-                fee_rate=opp.sell_fee,
+                price=opp.sell_price,
             )
-        except Exception as exc:
+        except Exception as exc:  # defensive
             logger.warning(
-                f"[EXECUTOR] SELL leg exception for {opp.symbol} on "
-                f"{opp.sell_exchange}({opp.sell_instrument}): {exc}"
+                "[EXECUTOR] SELL leg exception for %s on %s(%s): %s",
+                opp.symbol,
+                opp.sell_exchange,
+                opp.sell_instrument,
+                exc,
             )
-            # In live trading you might want to hedge here.
-            # For now: treat the whole arbitrage as failed.
             raise ValueError("SELL leg failed with exception") from exc
 
         if not sell_trade:
             logger.warning(
-                f"[EXECUTOR] SELL leg failed for {opp.symbol} on "
-                f"{opp.sell_exchange}({opp.sell_instrument}): no trade result returned"
+                "[EXECUTOR] SELL leg failed for %s on %s(%s): no trade result",
+                opp.symbol,
+                opp.sell_exchange,
+                opp.sell_instrument,
             )
             raise ValueError("SELL leg failed (no trade result)")
 
         if hasattr(sell_trade, "ok") and not getattr(sell_trade, "ok"):
             logger.warning(
-                f"[EXECUTOR] SELL leg failed for {opp.symbol} on "
-                f"{opp.sell_exchange}({opp.sell_instrument}): "
-                f"{getattr(sell_trade, 'error', 'ok == False')}"
+                "[EXECUTOR] SELL leg failed for %s on %s(%s): %s",
+                opp.symbol,
+                opp.sell_exchange,
+                opp.sell_instrument,
+                getattr(sell_trade, "error", "ok == False"),
             )
             raise ValueError("SELL leg failed (ok == False)")
 
@@ -163,12 +187,13 @@ class TradeExecutor:
                 getattr(sell_trade, "message", "success == False"),
             )
             raise ValueError("SELL leg failed (success == False)")
-        
-        # 5) Both legs succeeded: log and return
+
         logger.info(
-            f"[EXECUTOR] Done: buy @ {buy_trade.price:.4f} on {buy_trade.exchange}, "
-            f"sell @ {sell_trade.price:.4f} on {sell_trade.exchange}"
+            "[EXECUTOR] Done: buy @ %.4f on %s, sell @ %.4f on %s",
+            buy_trade.price,
+            buy_trade.exchange,
+            sell_trade.price,
+            sell_trade.exchange,
         )
 
         return buy_trade, sell_trade
-

@@ -21,10 +21,13 @@ from .arbitrage_detector import ArbitrageDetector, ArbitrageOpportunity
 from .config import BotConfig, ExecutionMode
 from .exchange import (
     BinanceExchangeClient,
+    BinanceDemoExchangeClient,
     ExchangeClient,
     PaperExchangeClient,
     PancakeSwapExchangeClient,
+    PancakeSwapDemoExchangeClient,
 )
+from .exchange import BinanceDemoParams, PancakeDemoParams
 from .executor import TradeExecutor
 from .risk import RiskManager
 from .state import BotState
@@ -103,24 +106,45 @@ def _build_market_data_client(config: BotConfig, symbol_mapping: Optional[Dict[s
         use_jetstream=False,
         cex=cex_configs or None,
         dex=dex_configs or None,
-        enable_csv=True,
+        enable_csv=config.enable_csv,
     )
 
     return client
 
 
-def _build_exchange_clients(config: BotConfig, state: BotState) -> Dict[Tuple[str, str], ExchangeClient]:
+# src/market_data_client/arbitrage/bot.py
+from .config import BotConfig, ExecutionMode
+from .exchange import (
+    BinanceExchangeClient,
+    BinanceDemoExchangeClient,
+    ExchangeClient,
+    PaperExchangeClient,
+    PancakeSwapExchangeClient,
+    PancakeSwapDemoExchangeClient,
+)
+from .state import BotState
+
+def _build_exchange_clients(
+    config: BotConfig,
+    state: BotState,
+    demo_binance: Optional[Dict[Tuple[str, str], BinanceDemoParams]] = None,
+    demo_pancake: Optional[Dict[Tuple[str, str], PancakeDemoParams]] = None,
+) -> Dict[Tuple[str, str], ExchangeClient]:
     """
     Build ExchangeClient instances for all (exchange, instrument) pairs
     defined in the bot configuration.
+
+    In DEMO mode, external dependencies (web3, router, testnet keys, ...)
+    are passed in via demo_binance / demo_pancake.
     """
     clients: Dict[Tuple[str, str], ExchangeClient] = {}
 
-    # Initialize paper balances if configured
-    for (ex, inst), balances in config.paper_initial_balances.items():
-        account = state.get_or_create_account(ex, inst)
-        for asset, amount in balances.items():
-            account.deposit(asset, amount)
+    # Initialize balances for PAPER / DEMO modes
+    if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
+        for (ex, inst), balances in config.paper_initial_balances.items():
+            account = state.get_or_create_account(ex, inst)
+            for asset, amount in balances.items():
+                account.deposit(asset, amount)
 
     for ex, inst in config.exchanges:
         key = (ex, inst)
@@ -129,24 +153,79 @@ def _build_exchange_clients(config: BotConfig, state: BotState) -> Dict[Tuple[st
             client = PaperExchangeClient(name=ex, instrument=inst, state=state)
             clients[key] = client
             logger.info(f"[BOT] Using PAPER client for {ex}({inst})")
-        else:
-            # LIVE mode
+        elif config.mode == ExecutionMode.LIVE:
             if ex == "Binance":
-                client = BinanceExchangeClient(instrument=inst, mode=ExecutionMode.LIVE)
-                clients[key] = client
-                logger.info(f"[BOT] Using LIVE Binance client for {inst}")
-            elif ex in ("PancakeSwapV2", "PancakeSwapV3"):
-                client = PancakeSwapExchangeClient(
-                    exchange_name=ex,
+                client = BinanceExchangeClient(
+                    name=ex,
                     instrument=inst,
-                    mode=ExecutionMode.LIVE,
+                    state=state,
                 )
                 clients[key] = client
-                logger.info(f"[BOT] Using LIVE {ex} client")
+                logger.info(f"[BOT] Using LIVE Binance client for {ex}({inst})")
+
+            elif ex in ("PancakeSwapV2", "PancakeSwapV3"):
+                client = PancakeSwapExchangeClient(
+                    name=ex,
+                    instrument=inst,
+                    state=state,
+                )
+                clients[key] = client
+                logger.info(f"[BOT] Using LIVE {ex} client for {inst}")
+
             else:
-                raise ValueError(f"Unknown exchange for LIVE mode: {ex}")
+                raise ValueError(f"LIVE mode does not support exchange {ex}")
+
+        elif config.mode == ExecutionMode.DEMO:
+            if ex == "Binance":
+                if demo_binance is None or key not in demo_binance:
+                    raise ValueError(
+                        f"DEMO mode: missing BinanceDemoParams for {ex}({inst})"
+                    )
+                params = demo_binance[key]
+                client = BinanceDemoExchangeClient(
+                    name=ex,
+                    instrument=inst,
+                    state=state,
+                    params=params,
+                )
+                clients[key] = client
+                logger.info(f"[BOT] Using DEMO Binance client for {ex}({inst})")
+
+            elif ex in ("PancakeSwapV2", "PancakeSwapV3"):
+                if demo_pancake is None or key not in demo_pancake:
+                    raise ValueError(
+                        f"DEMO mode: missing PancakeDemoParams for {ex}({inst})"
+                    )
+                params = demo_pancake[key]
+                client = PancakeSwapDemoExchangeClient(
+                    exchange_name=ex,
+                    instrument=inst,
+                    state=state,
+                    params=params,
+                )
+                clients[key] = client
+                logger.info(f"[BOT] Using DEMO {ex} client (forked chain)")
+
+            else:
+                # For other exchanges in DEMO mode fallback to paper client
+                fee_rate = 0.0005
+                client = PaperExchangeClient(
+                    name=ex,
+                    instrument=inst,
+                    state=state,
+                    fee_rate=fee_rate,
+                )
+                clients[key] = client
+                logger.info(
+                    f"[BOT] Using PaperExchangeClient for {ex}({inst}) in DEMO mode "
+                    f"(no special demo client configured)"
+                )
+
+        else:
+            raise ValueError(f"Unsupported execution mode: {config.mode}")
 
     return clients
+
 
 def _total_usdt_equity(state: BotState) -> float:
     """
@@ -170,6 +249,8 @@ async def run_arbitrage_bot(
     config: BotConfig,
     symbol_mapping: Optional[Dict[str, Dict[str, str]]] = None,
     stop_event: Optional[asyncio.Event] = None,
+    demo_binance_params: Optional[Dict[Tuple[str, str], BinanceDemoParams]] = None,
+    demo_pancake_params: Optional[Dict[Tuple[str, str], PancakeDemoParams]] = None,
 ) -> None:
     """
     Main entry point to run the arbitrage bot (PAPER or LIVE).
@@ -213,17 +294,22 @@ async def run_arbitrage_bot(
 
     # 3) State + exchange clients
     state = BotState()
-    exchange_clients = _build_exchange_clients(config, state)
+    exchange_clients = _build_exchange_clients(
+        config=config,
+        state=state,
+        demo_binance=demo_binance_params,
+        demo_pancake=demo_pancake_params,
+    )
 
     initial_equity_usdt: float = 0.0
     total_realized_pnl_usdt: float = 0.0
     total_trades_executed: int = 0
 
-    if config.mode == ExecutionMode.PAPER:
+    if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
         initial_equity_usdt = _total_usdt_equity(state)
+        mode_label = "PAPER" if config.mode == ExecutionMode.PAPER else "DEMO"
         logger.info(
-            f"[BOT] Initial PAPER equity (USDT-only approximation): "
-            f"{initial_equity_usdt:.4f} USDT"
+            f"[BOT] {mode_label} initial equity (USDT): {initial_equity_usdt:.4f}"
         )
 
     # 4) Risk + executor
@@ -255,7 +341,7 @@ async def run_arbitrage_bot(
 
                 for opp in opportunities:
                     equity_before = None
-                    if config.mode == ExecutionMode.PAPER:
+                    if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
                         equity_before = _total_usdt_equity(state)
 
                     try:
@@ -267,7 +353,7 @@ async def run_arbitrage_bot(
                         logger.warning(f"[BOT] Failed to execute opportunity: {exc}")
                         continue
 
-                    if config.mode == ExecutionMode.PAPER:
+                    if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
                         equity_after = _total_usdt_equity(state)
                         pnl = equity_after - (equity_before or 0.0)
                         pnl_pct = 0.0
@@ -296,7 +382,7 @@ async def run_arbitrage_bot(
         await client.stop()
         logger.info("[BOT] MarketDataClient stopped")
 
-        if config.mode == ExecutionMode.PAPER:
+        if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
             logger.info("\n" + "=" * 80)
             logger.info("[BOT] PAPER trading summary")
             logger.info("=" * 80)
