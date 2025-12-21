@@ -64,7 +64,7 @@ async def main():
                 f"lat_src={ms(lat_src)} lat_pub={ms(lat_pub)}"
             )
 
-    # Binance + PancakeSwapV2 + V3 둘 다 들음
+    # Binance + PancakeSwapV2 + V3 
     client.add_listener(on_ev, exchange={"Binance","PancakeSwapV2","PancakeSwapV3"})
 
     try:

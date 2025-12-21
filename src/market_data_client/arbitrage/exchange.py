@@ -5,10 +5,15 @@ import asyncio
 import logging
 import time
 import json
+import hmac
+import hashlib
+import requests
+
 from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple, List
+from urllib.parse import urlencode
 
 from hexbytes import HexBytes
 from web3 import Web3
@@ -93,16 +98,25 @@ class TradeResult:
 @dataclass
 class BinanceDemoParams:
     """
-    Parameters for Binance demo mode.
+    Configuration for Binance demo mode.
 
-    For now this class is only stored and not used directly.
-    You can later plug in Binance testnet APIs here if you want.
+    Economic simulation:
+      - Always uses mainnet prices (passed in as `price` / `price_hint`)
+        and applies deterministic slippage + fees in memory.
+
+    Optional testnet execution:
+      - If `use_testnet_execution` is True AND api_key/api_secret are non-empty,
+        the client will also send a real order to Binance testnet REST.
+      - The result of that HTTP call is stored under trade.metadata["binance_testnet"].
+      - BotState balances and PnL are NEVER derived from testnet fills.
     """
 
-    api_key: str
-    api_secret: str
+    api_key: str = ""
+    api_secret: str = ""
     base_url: str = "https://testnet.binance.vision"
-
+    recv_window_ms: int = 5000
+    http_timeout_sec: float = 10.0
+    use_testnet_execution: bool = False
 
 @dataclass
 class PancakeDemoParams:
@@ -326,13 +340,23 @@ class PancakeSwapExchangeClient(ExchangeClient):
     ) -> TradeResult:
         raise NotImplementedError("LIVE PancakeSwapExchangeClient is not implemented yet")
 
-class BinanceDemoExchangeClient(PaperExchangeClient):
-    """
-    Binance demo client.
 
-    Right now this class behaves like PaperExchangeClient, but keeps
-    a BinanceDemoParams instance so that you can later plug in
-    Binance testnet API calls if you want to.
+class BinanceDemoExchangeClient(ExchangeClient):
+    """
+    Binance demo client with two layers:
+
+      1) Economic layer (always on):
+         - Uses theoretical/mainnet price passed as `price`
+         - Applies deterministic slippage and taker fee on the quote asset
+         - Updates BotState balances in memory
+         - Attaches `binance_demo` metadata with full price/PnL breakdown
+
+      2) Infrastructure layer (optional):
+         - If BinanceDemoParams.use_testnet_execution is True, also sends
+           a real MARKET order to Binance testnet REST.
+         - The HTTP response (or error) is stored under `binance_testnet`
+           in TradeResult.metadata.
+         - Testnet fills NEVER affect balances or economic PnL.
     """
 
     def __init__(
@@ -341,15 +365,238 @@ class BinanceDemoExchangeClient(PaperExchangeClient):
         instrument: str,
         state: "BotState",
         params: Optional[BinanceDemoParams] = None,
-        fee_rate: float = 0.0005,
+        fee_rate: float = 0.0004,
+        default_slippage_bps: float = 1.0,
     ) -> None:
-        super().__init__(name=name, instrument=instrument, state=state, fee_rate=fee_rate)
-        self._params = params
+        super().__init__(name=name, instrument=instrument, state=state)
+        self._params: BinanceDemoParams = params or BinanceDemoParams()
+        self._fee_rate = float(fee_rate)
+        self._default_slippage_bps = float(default_slippage_bps)
+        self._mode = ExecutionMode.DEMO
+
         logger.info(
-            "BinanceDemoExchangeClient initialized in in-memory mode. "
-            "Wire real Binance testnet APIs here if needed."
+            "BinanceDemoExchangeClient initialized. "
+            "Economic layer uses in-memory fills with mainnet-like prices. "
+            "Testnet execution is %s.",
+            "ENABLED" if self._params.use_testnet_execution else "DISABLED",
         )
 
+    async def create_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: float,
+        price: float,
+        order_type: OrderType = OrderType.MARKET,
+        **kwargs: object,
+    ) -> TradeResult:
+        """
+        Create a demo order on Binance.
+
+        Economic layer:
+          - Uses `price` as theoretical/mainnet price.
+          - Applies slippage_bps (default self._default_slippage_bps) to derive
+            execution_price.
+          - Applies taker fee on the quote asset (self._fee_rate).
+          - Updates BotState balances (off-chain accounting).
+          - Returns TradeResult with execution_price and deltas.
+
+        Infrastructure layer (optional):
+          - If self._params.use_testnet_execution is True AND both api_key and
+            api_secret are set, sends a MARKET order to Binance testnet REST.
+          - Stores the raw HTTP response or error under metadata["binance_testnet"].
+        """
+        if price is None or price <= 0:
+            raise ValueError("Binance demo client requires a positive theoretical price")
+
+        theoretical_price = float(price)
+        qty = float(quantity)
+
+        # Slippage in basis points (1 bps = 0.01%)
+        slippage_bps = float(kwargs.get("slippage_bps", self._default_slippage_bps))
+        slip_factor = slippage_bps / 10_000.0
+
+        # Derive execution price from theoretical price + directional slippage.
+        if side == OrderSide.BUY:
+            # Buyer pays slightly worse price
+            execution_price = theoretical_price * (1.0 + slip_factor)
+        elif side == OrderSide.SELL:
+            # Seller receives slightly worse price
+            execution_price = theoretical_price * (1.0 - slip_factor)
+        else:
+            raise ValueError(f"Unsupported side for Binance demo client: {side}")
+
+        # Split symbol into base / quote, e.g. "BNBUSDT" -> ("BNB", "USDT")
+        base_asset, quote_asset = self._split_symbol(symbol)
+        account = self._state.get_or_create_account(self.name, self.instrument)
+
+        # --- Economic layer: update balances using execution_price ---
+        if side == OrderSide.BUY:
+            cost_quote = qty * execution_price
+            if account.balances.get(quote_asset, 0.0) < cost_quote:
+                raise InsufficientBalanceError(
+                    f"Not enough {quote_asset} balance to buy {symbol}: "
+                    f"have={account.balances.get(quote_asset, 0.0)} need={cost_quote}"
+                )
+
+            account.balances[quote_asset] = account.balances.get(quote_asset, 0.0) - cost_quote
+            account.balances[base_asset] = account.balances.get(base_asset, 0.0) + qty
+
+            base_delta = qty
+            quote_delta_before_fee = -cost_quote
+
+        elif side == OrderSide.SELL:
+            if account.balances.get(base_asset, 0.0) < qty:
+                raise InsufficientBalanceError(
+                    f"Not enough {base_asset} balance to sell {symbol}: "
+                    f"have={account.balances.get(base_asset, 0.0)} need={qty}"
+                )
+
+            proceeds_quote = qty * execution_price
+            account.balances[base_asset] = account.balances.get(base_asset, 0.0) - qty
+            account.balances[quote_asset] = account.balances.get(quote_asset, 0.0) + proceeds_quote
+
+            base_delta = -qty
+            quote_delta_before_fee = proceeds_quote
+
+        else:
+            # This should be unreachable due to the earlier branch
+            raise ValueError(f"Unsupported side for Binance demo client: {side}")
+
+        # Apply taker fee on the quote asset
+        fee_amount = abs(quote_delta_before_fee) * self._fee_rate
+        account.balances[quote_asset] -= fee_amount
+        quote_delta_after_fee = quote_delta_before_fee - fee_amount
+
+        # Build TradeResult (economic simulation only)
+        trade = TradeResult(
+            exchange=self.name,
+            instrument=self.instrument,
+            symbol=symbol,
+            side=side,
+            quantity=qty,
+            price=execution_price,
+            fee=self._fee_rate,
+            base_delta=base_delta,
+            quote_delta=quote_delta_after_fee,
+            success=True,
+        )
+
+        # Attach demo economic metadata
+        demo_meta: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": side.value,
+            "instrument": self.instrument,
+            "theoretical_price": theoretical_price,
+            "execution_price": execution_price,
+            "slippage_bps": slippage_bps,
+            "fee_rate": self._fee_rate,
+            "base_delta": base_delta,
+            "quote_delta_before_fee": quote_delta_before_fee,
+            "quote_delta_after_fee": quote_delta_after_fee,
+        }
+
+        trade.metadata = trade.metadata or {}
+        trade.metadata["binance_demo"] = demo_meta
+
+        # --- Infrastructure layer: optionally send a real testnet order ---
+        if (
+            self._params.use_testnet_execution
+            and self._params.api_key
+            and self._params.api_secret
+        ):
+            try:
+                loop = asyncio.get_running_loop()
+                raw_result = await loop.run_in_executor(
+                    None,
+                    self._send_testnet_order_sync,
+                    symbol,
+                    side,
+                    qty,
+                    order_type,
+                )
+                trade.metadata["binance_testnet"] = raw_result
+            except Exception as exc:
+                # We never fail the economic trade because of testnet issues.
+                trade.metadata["binance_testnet_error"] = str(exc)
+
+        # Record trade in BotState (economic accounting only)
+        self._state.record_trade(trade)
+        return trade
+
+    def _send_testnet_order_sync(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: float,
+        order_type: OrderType,
+    ) -> Dict[str, Any]:
+        """
+        Best-effort synchronous helper that sends a MARKET order
+        to Binance testnet REST API.
+
+        - Uses BinanceDemoParams for base_url / api_key / api_secret.
+        - Does NOT affect balances or PnL.
+        - Intended ONLY for checking that your signing / HTTP wiring works.
+        """
+        import json as _json
+        import time as _time
+        import hmac as _hmac
+        import hashlib as _hashlib
+        from urllib import parse as _parse, request as _request
+
+        if not self._params.api_key or not self._params.api_secret:
+            return {"error": "Missing api_key or api_secret for Binance testnet execution"}
+
+        url = self._params.base_url.rstrip("/") + "/api/v3/order"
+
+        ts = int(_time.time() * 1000)
+        params = {
+            "symbol": symbol,
+            "side": side.value,
+            "type": "MARKET" if order_type == OrderType.MARKET else str(order_type),
+            "quantity": f"{quantity}",
+            "timestamp": str(ts),
+            "recvWindow": str(self._params.recv_window_ms),
+        }
+
+        query_string = _parse.urlencode(params)
+        signature = _hmac.new(
+            self._params.api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            _hashlib.sha256,
+        ).hexdigest()
+
+        body = (query_string + "&signature=" + signature).encode("utf-8")
+
+        headers = {
+            "X-MBX-APIKEY": self._params.api_key,
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+
+        req = _request.Request(url, data=body, headers=headers, method="POST")
+
+        try:
+            with _request.urlopen(req, timeout=self._params.http_timeout_sec) as resp:
+                status = resp.getcode()
+                raw_body = resp.read().decode("utf-8")
+            try:
+                parsed_body: Any = _json.loads(raw_body)
+            except Exception:
+                parsed_body = raw_body
+
+            return {
+                "status": status,
+                "endpoint": url,
+                "request_params": params,
+                "response": parsed_body,
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "endpoint": url,
+                "error": str(exc),
+            }
 
 class PancakeSwapDemoExchangeClient(ExchangeClient):
     """
@@ -386,30 +633,50 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         price_hint: Optional[float] = None,
         **_: object,
     ) -> TradeResult:
+        """
+        Create an order on PancakeSwap in DEMO mode.
+
+        - price / price_hint: theoretical expected price from the strategy.
+        - Forked-chain simulation (_run_multi_block_flow) computes avg_fill_price.
+        - BotState balances and TradeResult.price use that avg_fill_price
+          when available; otherwise fall back to the theoretical price.
+        """
+        # 1) Resolve theoretical price from price or price_hint
         if price is None and price_hint is not None:
             price = price_hint
         if price is None:
             raise ValueError("Pancake demo client requires an explicit price or price_hint")
+
+        theoretical_price = float(price)
 
         if fee_rate is None:
             fee_rate = self._params.default_fee_rate
 
         account = self._state.get_or_create_account(self.name, self.instrument)
 
+        # 2) Run forked-chain multi-block simulation to get per-block metadata
         per_block_meta: Optional[Dict[str, Any]] = None
-
         if self._params.block_offsets and len(self._params.block_offsets) > 0:
             per_block_meta = await self._run_multi_block_flow(
                 symbol=symbol,
                 side=side,
                 quantity=quantity,
-                price=price,
+                price=theoretical_price,
             )
+
+        # 3) Determine actual execution price used for accounting:
+        #    prefer avg_fill_price from fork, otherwise use theoretical price.
+        execution_price = theoretical_price
+        if per_block_meta is not None:
+            avg_fill = per_block_meta.get("avg_fill_price")
+            if isinstance(avg_fill, (int, float)) and avg_fill > 0:
+                execution_price = float(avg_fill)
 
         base_asset = symbol.replace(quote_asset, "")
 
+        # 4) Apply balance changes using execution_price
         if side == OrderSide.BUY:
-            cost_quote = quantity * price
+            cost_quote = quantity * execution_price
             if account.balances.get(quote_asset, 0.0) < cost_quote:
                 raise InsufficientBalanceError(
                     f"Not enough {quote_asset} balance to buy {symbol}: "
@@ -426,7 +693,7 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                     f"Not enough {base_asset} balance to sell {symbol}: "
                     f"have={account.balances.get(base_asset, 0.0)} need={quantity}"
                 )
-            proceeds_quote = quantity * price
+            proceeds_quote = quantity * execution_price
             account.balances[base_asset] = account.balances.get(base_asset, 0.0) - quantity
             account.balances[quote_asset] = account.balances.get(quote_asset, 0.0) + proceeds_quote
             base_delta = -quantity
@@ -435,7 +702,7 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         else:
             raise ValueError(f"Unsupported side for Pancake demo client: {side}")
 
-        # Apply taker fee on quote asset
+        # 5) Apply taker fee on quote asset
         fee_amount = abs(quote_delta) * fee_rate
         account.balances[quote_asset] -= fee_amount
         quote_delta_after_fee = quote_delta - fee_amount
@@ -446,16 +713,25 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             symbol=symbol,
             side=side,
             quantity=quantity,
-            price=price,
+            price=execution_price,
             fee=fee_rate,
             base_delta=base_delta,
             quote_delta=quote_delta_after_fee,
             success=True,
         )
 
+        # 6) Attach demo metadata with both theoretical and execution price info
         if per_block_meta is not None:
+            enriched_meta = dict(per_block_meta)
+            enriched_meta.setdefault("theoretical_price", theoretical_price)
+            enriched_meta.setdefault(
+                "price_hint",
+                price_hint if price_hint is not None else theoretical_price,
+            )
+            enriched_meta.setdefault("execution_price", execution_price)
+
             trade.metadata = trade.metadata or {}
-            trade.metadata["pancake_demo"] = per_block_meta
+            trade.metadata["pancake_demo"] = enriched_meta
 
         self._state.record_trade(trade)
         return trade
@@ -486,7 +762,6 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             price,
         )
         return meta
-
 
     def _run_multi_block_swaps_sync(
         self,
@@ -690,15 +965,35 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                     if decimals_out is None:
                         decimals_out = token_out_contract.functions.decimals().call()
 
-                    if decimals_in is not None and decimals_out is not None and delta_in != 0:
+                    if (
+                        decimals_in is not None
+                        and decimals_out is not None
+                        and delta_in is not None
+                        and delta_out is not None
+                        and delta_in != 0
+                    ):
                         scale_in = 10 ** int(decimals_in)
                         scale_out = 10 ** int(decimals_out)
 
-                        qty_in = -delta_in / scale_in if delta_in < 0 else delta_in / scale_in
-                        qty_out = delta_out / scale_out
+                        if side == OrderSide.BUY:
+                            # BUY:
+                            #   token_in  = base  (spent)
+                            #   token_out = quote (received)
+                            base_qty = -delta_in / scale_in      # > 0
+                            quote_qty = delta_out / scale_out    # > 0
+                        else:
+                            # SELL:
+                            #   token_in  = quote (spent)
+                            #   token_out = base  (received)
+                            quote_qty = -delta_in / scale_in     # > 0
+                            base_qty = delta_out / scale_out     # > 0
 
-                        if qty_in != 0:
-                            fill_price = qty_out / abs(qty_in)
+                        fill_price = None
+                        return_vs_hint = None
+
+                        if base_qty != 0:
+                            # Always express price as QUOTE per 1 BASE
+                            fill_price = quote_qty / base_qty
                             if price > 0:
                                 return_vs_hint = fill_price / price - 1.0
                 except Exception:
@@ -706,6 +1001,7 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                     delta_out = None
                     fill_price = None
                     return_vs_hint = None
+
 
             result: Dict[str, Any] = {
                 "fork_block": fork_block,
@@ -757,8 +1053,6 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             demo_meta["avg_return_vs_hint"] = sum(returns) / len(returns)
 
         return demo_meta
-
-
 
     def _wait_for_upstream_block(
         self,
