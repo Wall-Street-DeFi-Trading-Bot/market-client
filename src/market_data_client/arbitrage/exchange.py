@@ -5,10 +5,13 @@ import asyncio
 import logging
 import time
 import json
-import hmac
-import hashlib
-import requests
+import json as _json
+import time as _time
+import hmac as _hmac
+import hashlib as _hashlib
+from urllib import parse as _parse, request as _request
 
+from urllib import error as _error
 from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
@@ -95,28 +98,39 @@ class TradeResult:
     metadata: Optional[Dict[str, Any]] = None
 
 
+
 @dataclass
 class BinanceDemoParams:
     """
-    Configuration for Binance demo mode.
+    Demo params for Binance.
 
-    Economic simulation:
-      - Always uses mainnet prices (passed in as `price` / `price_hint`)
-        and applies deterministic slippage + fees in memory.
+    This supports separate credentials for Spot testnet and Futures testnet.
+    - Spot testnet:    https://testnet.binance.vision
+    - Futures testnet: https://testnet.binancefuture.com
 
-    Optional testnet execution:
-      - If `use_testnet_execution` is True AND api_key/api_secret are non-empty,
-        the client will also send a real order to Binance testnet REST.
-      - The result of that HTTP call is stored under trade.metadata["binance_testnet"].
-      - BotState balances and PnL are NEVER derived from testnet fills.
+    If the matching credential is missing, testnet execution is skipped
+    but the in-memory economic simulation still succeeds.
     """
 
-    api_key: str = ""
-    api_secret: str = ""
-    base_url: str = "https://testnet.binance.vision"
+    # Spot testnet
+    spot_api_key: str = ""
+    spot_api_secret: str = ""
+    spot_base_url: str = "https://testnet.binance.vision"
+
+    # Futures testnet
+    futures_api_key: str = ""
+    futures_api_secret: str = ""
+    futures_base_url: str = "https://testnet.binancefuture.com"
+
     recv_window_ms: int = 5000
     http_timeout_sec: float = 10.0
+
+    # If True, try to send a real order to testnet (best-effort)
     use_testnet_execution: bool = False
+
+    # If True, mark the TradeResult as failed when testnet call fails.
+    # Note: missing credentials are treated as "skipped", not a failure.
+    fail_on_testnet_error: bool = True
 
 @dataclass
 class PancakeDemoParams:
@@ -373,6 +387,7 @@ class BinanceDemoExchangeClient(ExchangeClient):
         self._fee_rate = float(fee_rate)
         self._default_slippage_bps = float(default_slippage_bps)
         self._mode = ExecutionMode.DEMO
+        self._symbol_filters_cache: Dict[Tuple[str, str, str], Dict[str, str]] = {}
 
         logger.info(
             "BinanceDemoExchangeClient initialized. "
@@ -380,6 +395,128 @@ class BinanceDemoExchangeClient(ExchangeClient):
             "Testnet execution is %s.",
             "ENABLED" if self._params.use_testnet_execution else "DISABLED",
         )
+
+    def _get_spot_symbol_filters_sync(self, base_url: str, symbol: str, for_market: bool) -> Dict[str, str]:
+        """
+        Fetch spot symbol filters from /api/v3/exchangeInfo.
+        Uses MARKET_LOT_SIZE for MARKET orders, otherwise LOT_SIZE.
+        """
+        import json as _json
+        from urllib import parse as _parse, request as _request
+
+        url = base_url.rstrip("/") + "/api/v3/exchangeInfo?" + _parse.urlencode({"symbol": symbol})
+        with _request.urlopen(url, timeout=self._params.http_timeout_sec) as resp:
+            raw = resp.read().decode("utf-8")
+
+        data = _json.loads(raw)
+        info = data["symbols"][0]
+        filt_map = {f["filterType"]: f for f in info.get("filters", [])}
+
+        ft = "MARKET_LOT_SIZE" if for_market else "LOT_SIZE"
+        lot = filt_map.get(ft) or filt_map.get("LOT_SIZE") or {}
+
+        return {
+            "stepSize": str(lot.get("stepSize", "0")),
+            "minQty": str(lot.get("minQty", "0")),
+            "minNotional": "0",
+        }
+
+
+    def _round_step_down_str(self, qty: float, step_size: str) -> str:
+        """
+        Round quantity down to a multiple of stepSize, returning a decimal string.
+        """
+        from decimal import Decimal, ROUND_DOWN
+
+        q = Decimal(str(qty))
+        s = Decimal(str(step_size))
+
+        if s <= 0:
+            return format(q, "f")
+
+        rounded = (q // s) * s
+
+        # Ensure we don't produce scientific notation
+        rounded = rounded.quantize(s, rounding=ROUND_DOWN)
+        return format(rounded, "f")
+
+    def _get_futures_symbol_filters_sync(self, base_url: str, symbol: str, for_market: bool) -> Dict[str, str]:
+        """
+        Fetch futures symbol filters from /fapi/v1/exchangeInfo.
+        Uses MARKET_LOT_SIZE for MARKET orders, otherwise LOT_SIZE.
+        """
+        import json as _json
+        from urllib import parse as _parse, request as _request
+
+        url = base_url.rstrip("/") + "/fapi/v1/exchangeInfo?" + _parse.urlencode({"symbol": symbol})
+        with _request.urlopen(url, timeout=self._params.http_timeout_sec) as resp:
+            raw = resp.read().decode("utf-8")
+
+        data = _json.loads(raw)
+        info = data["symbols"][0]
+        filt_map = {f["filterType"]: f for f in info.get("filters", [])}
+
+        ft = "MARKET_LOT_SIZE" if for_market else "LOT_SIZE"
+        lot = filt_map.get(ft) or filt_map.get("LOT_SIZE") or {}
+
+        return {
+            "stepSize": str(lot.get("stepSize", "0")),
+            "minQty": str(lot.get("minQty", "0")),
+            "minNotional": "0",
+        }
+
+
+    def _get_testnet_symbol_filters_cached(
+        self,
+        mode_label: str,
+        base_url: str,
+        symbol: str,
+        order_type: OrderType,
+    ) -> Dict[str, str]:
+        """
+        Return cached symbol filters; fetch from exchangeInfo if missing.
+        mode_label: "spot" or "futures"
+        """
+        for_market = (order_type == OrderType.MARKET)
+        kind = "market" if for_market else "lot"
+
+        cache_key = (mode_label, symbol, kind)
+        if cache_key in self._symbol_filters_cache:
+            return self._symbol_filters_cache[cache_key]
+
+        if mode_label == "spot":
+            filt = self._get_spot_symbol_filters_sync(base_url, symbol, for_market=for_market)
+        else:
+            filt = self._get_futures_symbol_filters_sync(base_url, symbol, for_market=for_market)
+
+        self._symbol_filters_cache[cache_key] = filt
+        return filt
+
+
+
+    def _normalize_qty_str(self, qty: float, step_size: str, min_qty: str) -> str:
+        """
+        Floor quantity to stepSize and enforce minQty. Returns a plain decimal string.
+        """
+        from decimal import Decimal, ROUND_DOWN
+
+        q = Decimal(str(qty))
+        step = Decimal(str(step_size))
+        mn = Decimal(str(min_qty))
+
+        if step <= 0:
+            # No step info; still enforce minQty.
+            q2 = q if q >= mn else mn
+            return format(q2, "f")
+
+        q2 = (q // step) * step
+        if q2 < mn:
+            return "0"
+
+        # Quantize to step to avoid scientific notation and enforce decimal places.
+        q2 = q2.quantize(step, rounding=ROUND_DOWN)
+        return format(q2, "f")
+
 
     async def create_order(
         self,
@@ -499,12 +636,7 @@ class BinanceDemoExchangeClient(ExchangeClient):
         trade.metadata = trade.metadata or {}
         trade.metadata["binance_demo"] = demo_meta
 
-        # --- Infrastructure layer: optionally send a real testnet order ---
-        if (
-            self._params.use_testnet_execution
-            and self._params.api_key
-            and self._params.api_secret
-        ):
+        if self._params.use_testnet_execution:
             try:
                 loop = asyncio.get_running_loop()
                 raw_result = await loop.run_in_executor(
@@ -516,14 +648,48 @@ class BinanceDemoExchangeClient(ExchangeClient):
                     order_type,
                 )
                 trade.metadata["binance_testnet"] = raw_result
-            except Exception as exc:
-                # We never fail the economic trade because of testnet issues.
-                trade.metadata["binance_testnet_error"] = str(exc)
 
-        # Record trade in BotState (economic accounting only)
+                if self._params.fail_on_testnet_error:
+                    if raw_result.get("status") == "error":
+                        trade.success = False
+                        resp = raw_result.get("response")
+                        trade.message = f"binance_testnet failed: {raw_result.get('error')} response={resp}"
+
+            except Exception as exc:
+                # Do not crash the economic simulation due to testnet issues.
+                trade.metadata["binance_testnet_error"] = str(exc)
+                if self._params.fail_on_testnet_error:
+                    trade.success = False
+                    trade.message = f"binance_testnet failed: {exc}"
+
         self._state.record_trade(trade)
         return trade
 
+
+    def _select_testnet_endpoint_and_creds(self) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], str]:
+        """
+        Returns (base_url, path, api_key, api_secret, mode_label).
+
+        mode_label is one of: "spot", "futures".
+        If creds are missing, api_key/api_secret can be None.
+        """
+        if self.instrument == "perpetual":
+            return (
+                (self._params.futures_base_url or "https://testnet.binancefuture.com").rstrip("/"),
+                "/fapi/v1/order",
+                self._params.futures_api_key or None,
+                self._params.futures_api_secret or None,
+                "futures",
+            )
+
+        return (
+            (self._params.spot_base_url or "https://testnet.binance.vision").rstrip("/"),
+            "/api/v3/order",
+            self._params.spot_api_key or None,
+            self._params.spot_api_secret or None,
+            "spot",
+        )
+    
     def _send_testnet_order_sync(
         self,
         symbol: str,
@@ -532,37 +698,57 @@ class BinanceDemoExchangeClient(ExchangeClient):
         order_type: OrderType,
     ) -> Dict[str, Any]:
         """
-        Best-effort synchronous helper that sends a MARKET order
-        to Binance testnet REST API.
+        Best-effort synchronous helper that sends a MARKET order to Binance testnet REST API.
 
-        - Uses BinanceDemoParams for base_url / api_key / api_secret.
+        - Selects correct endpoint and credentials based on self.instrument.
+        - If credentials are missing, returns status="skipped" (not an error).
         - Does NOT affect balances or PnL.
-        - Intended ONLY for checking that your signing / HTTP wiring works.
+        - Normalizes quantity to stepSize/minQty to avoid precision errors (-1111).
         """
-        import json as _json
-        import time as _time
-        import hmac as _hmac
-        import hashlib as _hashlib
-        from urllib import parse as _parse, request as _request
+        base_url, path, api_key, api_secret, mode_label = self._select_testnet_endpoint_and_creds()
 
-        if not self._params.api_key or not self._params.api_secret:
-            return {"error": "Missing api_key or api_secret for Binance testnet execution"}
+        if not base_url or not path:
+            return {"status": "error", "error": "Missing base_url or path"}
 
-        url = self._params.base_url.rstrip("/") + "/api/v3/order"
+        if not api_key or not api_secret:
+            return {
+                "status": "skipped",
+                "mode": mode_label,
+                "endpoint": base_url + path,
+                "reason": "Missing credentials for this instrument",
+            }
+
+        url = base_url + path
+
+        # Normalize quantity according to exchangeInfo filters (stepSize/minQty)
+        try:
+            filters = self._get_testnet_symbol_filters_cached(mode_label, base_url, symbol, order_type)
+            qty_str = self._normalize_qty_str(
+                quantity,
+                filters.get("stepSize", "0"),
+                filters.get("minQty", "0"),
+            )
+        except Exception as exc:
+            return {
+                "status": "error",
+                "mode": mode_label,
+                "endpoint": url,
+                "error": f"Failed to fetch/normalize symbol filters: {exc}",
+            }
 
         ts = int(_time.time() * 1000)
         params = {
             "symbol": symbol,
             "side": side.value,
             "type": "MARKET" if order_type == OrderType.MARKET else str(order_type),
-            "quantity": f"{quantity}",
+            "quantity": qty_str,
             "timestamp": str(ts),
             "recvWindow": str(self._params.recv_window_ms),
         }
 
         query_string = _parse.urlencode(params)
         signature = _hmac.new(
-            self._params.api_secret.encode("utf-8"),
+            api_secret.encode("utf-8"),
             query_string.encode("utf-8"),
             _hashlib.sha256,
         ).hexdigest()
@@ -570,7 +756,7 @@ class BinanceDemoExchangeClient(ExchangeClient):
         body = (query_string + "&signature=" + signature).encode("utf-8")
 
         headers = {
-            "X-MBX-APIKEY": self._params.api_key,
+            "X-MBX-APIKEY": api_key,
             "Content-Type": "application/x-www-form-urlencoded",
         }
 
@@ -580,6 +766,7 @@ class BinanceDemoExchangeClient(ExchangeClient):
             with _request.urlopen(req, timeout=self._params.http_timeout_sec) as resp:
                 status = resp.getcode()
                 raw_body = resp.read().decode("utf-8")
+
             try:
                 parsed_body: Any = _json.loads(raw_body)
             except Exception:
@@ -587,16 +774,44 @@ class BinanceDemoExchangeClient(ExchangeClient):
 
             return {
                 "status": status,
+                "mode": mode_label,
                 "endpoint": url,
                 "request_params": params,
                 "response": parsed_body,
             }
+
+        except _error.HTTPError as exc:
+            raw_body = ""
+            try:
+                raw_body = exc.read().decode("utf-8")
+            except Exception:
+                pass
+
+            try:
+                parsed_body: Any = _json.loads(raw_body) if raw_body else raw_body
+            except Exception:
+                parsed_body = raw_body
+
+            return {
+                "status": "error",
+                "mode": mode_label,
+                "endpoint": url,
+                "http_status": exc.code,
+                "request_params": params,
+                "response": parsed_body,
+                "error": f"HTTPError {exc.code}",
+            }
+
         except Exception as exc:
             return {
                 "status": "error",
+                "mode": mode_label,
                 "endpoint": url,
                 "error": str(exc),
+                "request_params": params,
             }
+
+
 
 class PancakeSwapDemoExchangeClient(ExchangeClient):
     """
@@ -663,6 +878,27 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                 quantity=quantity,
                 price=theoretical_price,
             )
+
+        if per_block_meta is not None:
+            all_ok = bool(per_block_meta.get("all_ok", True))
+            avg_fill = per_block_meta.get("avg_fill_price", None)
+
+            if (not all_ok) or (not isinstance(avg_fill, (int, float))) or (avg_fill <= 0):
+                trade = TradeResult(
+                    exchange=self.name,
+                    instrument=self.instrument,
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    price=float(price),
+                    fee=fee_rate,
+                    base_delta=0.0,
+                    quote_delta=0.0,
+                    success=False,
+                    message="pancake_demo swap failed (one or more fork swaps reverted)",
+                    metadata={"pancake_demo": per_block_meta},
+                )
+                return trade
 
         # 3) Determine actual execution price used for accounting:
         #    prefer avg_fill_price from fork, otherwise use theoretical price.
@@ -762,7 +998,7 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             price,
         )
         return meta
-
+    
     def _run_multi_block_swaps_sync(
         self,
         symbol: str,
@@ -774,10 +1010,11 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         Run the same swap on multiple forked blocks and collect per-block metadata.
 
         For each forked block this method:
-          - Resets the local fork to base_block + offset
-          - Builds a swap transaction via self._params.build_swap_tx(...)
-          - Measures token_in and token_out balances before and after the swap
-          - Records per-block balance deltas, fill price, and return vs price hint
+          - Resets the fork to base_block + offset
+          - Impersonates or signs locally depending on params.private_key
+          - Builds and sends one swap transaction
+          - Measures token balances before and after the swap
+          - Records per-block fill price and return vs hint
         """
         web3 = self._web3
 
@@ -786,10 +1023,7 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         except Exception:
             pass
 
-        if self._params.block_offsets is None:
-            offsets = (1, 2, 3)
-        else:
-            offsets = tuple(self._params.block_offsets)
+        offsets = tuple(self._params.block_offsets or (1, 2, 3))
 
         upstream_web3 = Web3(Web3.HTTPProvider(self._params.upstream_rpc_url))
         try:
@@ -803,8 +1037,7 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         if provider is None:
             raise RuntimeError("Web3 provider must not be None for Pancake demo client")
 
-        fork_engine = getattr(self._params, "fork_engine", "anvil")
-
+        # Decide signing mode and trader address once.
         priv_key = self._params.private_key
         use_local_signing = bool(priv_key)
 
@@ -814,55 +1047,62 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         else:
             trader = Web3.to_checksum_address(self._params.account_address)
 
+        # Detect fork engine and select reset/impersonate methods.
+        fork_engine = getattr(self._params, "fork_engine", "auto")
+        if fork_engine == "auto":
+            fork_engine = self._detect_fork_engine(provider)
+            if fork_engine == "unknown":
+                ep = getattr(provider, "endpoint_uri", None)
+                raise RuntimeError(
+                    f"Fork RPC does not support anvil/hardhat reset. endpoint={ep}. "
+                    "Make sure params.web3 points to local anvil/hardhat."
+                )
+
+        if fork_engine == "hardhat":
+            reset_method = "hardhat_reset"
+            impersonate_method = "hardhat_impersonateAccount"
+        elif fork_engine == "anvil":
+            reset_method = "anvil_reset"
+            impersonate_method = "anvil_impersonateAccount"
+        else:
+            raise ValueError(f"Unknown fork engine: {fork_engine}")
+
         per_block_results: List[Dict[str, Any]] = []
 
         for offset in offsets:
             fork_block = base_block + offset
-
             self._wait_for_upstream_block(upstream_web3, fork_block)
 
-            if fork_engine == "hardhat":
-                reset_config = {
-                    "forking": {
-                        "jsonRpcUrl": self._params.upstream_rpc_url,
-                        "blockNumber": fork_block,
-                    }
+            reset_config = {
+                "forking": {
+                    "jsonRpcUrl": self._params.upstream_rpc_url,
+                    "blockNumber": fork_block,
                 }
-                resp = provider.make_request("hardhat_reset", [reset_config])
-                if isinstance(resp, dict) and "error" in resp:
-                    raise RuntimeError(f"hardhat_reset failed: {resp['error']}")
+            }
 
-                if not use_local_signing:
-                    provider.make_request("hardhat_impersonateAccount", [trader])
+            resp = provider.make_request(reset_method, [reset_config])
+            if isinstance(resp, dict) and "error" in resp:
+                raise RuntimeError(f"{reset_method} failed: {resp['error']}")
 
-            elif fork_engine == "anvil":
-                reset_config = {
-                    "forking": {
-                        "jsonRpcUrl": self._params.upstream_rpc_url,
-                        "blockNumber": fork_block,
-                    }
-                }
-                resp = provider.make_request("anvil_reset", [reset_config])
-                if isinstance(resp, dict) and "error" in resp:
-                    raise RuntimeError(f"anvil_reset failed: {resp['error']}")
+            if not use_local_signing:
+                provider.make_request(impersonate_method, [trader])
 
-                if not use_local_signing:
-                    provider.make_request("anvil_impersonateAccount", [trader])
-
-            else:
-                raise ValueError(f"Unknown fork engine: {fork_engine}")
+            builder_qty = float(quantity)
+            if side == OrderSide.BUY:
+                builder_qty = float(quantity) * float(price)
 
             tx_dict = self._params.build_swap_tx(
                 web3=web3,
                 symbol=symbol,
-                quantity=quantity,
+                quantity=builder_qty,
                 side=side.value,
             )
 
-            # Demo-only metadata injected by build_swap_tx_router
             token_in = tx_dict.pop("_demo_token_in", None)
             token_out = tx_dict.pop("_demo_token_out", None)
 
+            self._ensure_allowance(web3, trader, token_in, router, amount_in_wei, priv_key, use_local_signing)
+            
             token_in_contract = None
             token_out_contract = None
 
@@ -907,9 +1147,7 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             try:
                 if use_local_signing:
                     signed = Account.sign_transaction(tx_dict, priv_key)  # type: ignore[arg-type]
-                    raw_tx = getattr(signed, "rawTransaction", None)
-                    if raw_tx is None:
-                        raw_tx = getattr(signed, "raw_transaction", None)
+                    raw_tx = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
                     tx_hash = web3.eth.send_raw_transaction(raw_tx)
                 else:
                     tx_hash = web3.eth.send_transaction(tx_dict)
@@ -938,6 +1176,7 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                         )
                     except Exception as exc:
                         revert_reason = str(exc)
+
             except Exception as exc:
                 revert_reason = f"send_or_wait_error: {exc}"
 
@@ -976,32 +1215,22 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                         scale_out = 10 ** int(decimals_out)
 
                         if side == OrderSide.BUY:
-                            # BUY:
-                            #   token_in  = base  (spent)
-                            #   token_out = quote (received)
-                            base_qty = -delta_in / scale_in      # > 0
-                            quote_qty = delta_out / scale_out    # > 0
+                            base_qty = -delta_in / scale_in
+                            quote_qty = delta_out / scale_out
                         else:
-                            # SELL:
-                            #   token_in  = quote (spent)
-                            #   token_out = base  (received)
-                            quote_qty = -delta_in / scale_in     # > 0
-                            base_qty = delta_out / scale_out     # > 0
-
-                        fill_price = None
-                        return_vs_hint = None
+                            quote_qty = -delta_in / scale_in
+                            base_qty = delta_out / scale_out
 
                         if base_qty != 0:
-                            # Always express price as QUOTE per 1 BASE
                             fill_price = quote_qty / base_qty
                             if price > 0:
                                 return_vs_hint = fill_price / price - 1.0
+
                 except Exception:
                     delta_in = None
                     delta_out = None
                     fill_price = None
                     return_vs_hint = None
-
 
             result: Dict[str, Any] = {
                 "fork_block": fork_block,
@@ -1012,12 +1241,10 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
 
             if revert_reason is not None:
                 result["revert_reason"] = revert_reason
-
             if token_in:
                 result["token_in"] = token_in
             if token_out:
                 result["token_out"] = token_out
-
             if delta_in is not None:
                 result["delta_in"] = delta_in
             if delta_out is not None:
@@ -1035,24 +1262,26 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             "base_block": base_block,
             "block_offsets": list(offsets),
             "per_block_results": per_block_results,
-            "account_snapshot": {
-                "balances": dict(account.balances),
-            },
+            "account_snapshot": {"balances": dict(account.balances)},
         }
 
-        fill_prices = [
-            r["fill_price"] for r in per_block_results if "fill_price" in r
-        ]
-        returns = [
-            r["return_vs_hint"] for r in per_block_results if "return_vs_hint" in r
-        ]
+        all_ok = all(int(r.get("status", 0) or 0) == 1 for r in per_block_results)
+        demo_meta["all_ok"] = all_ok
+        demo_meta["ok_count"] = sum(1 for r in per_block_results if int(r.get("status", 0) or 0) == 1)
+        demo_meta["fail_count"] = len(per_block_results) - demo_meta["ok_count"]
 
-        if fill_prices:
+        fill_prices = [r["fill_price"] for r in per_block_results if "fill_price" in r]
+        if all_ok and len(fill_prices) == len(per_block_results):
             demo_meta["avg_fill_price"] = sum(fill_prices) / len(fill_prices)
+        else:
+            demo_meta["avg_fill_price"] = None
+
+        returns = [r["return_vs_hint"] for r in per_block_results if "return_vs_hint" in r]
         if returns:
             demo_meta["avg_return_vs_hint"] = sum(returns) / len(returns)
 
         return demo_meta
+
 
     def _wait_for_upstream_block(
         self,
@@ -1077,3 +1306,49 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                 )
 
             time.sleep(poll_interval)
+
+
+    def _rpc_supports(self, provider: Any, method: str) -> bool:
+        try:
+            resp = provider.make_request(method, [])
+            return isinstance(resp, dict) and ("error" not in resp)
+        except Exception:
+            return False
+
+    def _detect_fork_engine(self, provider: Any) -> str:
+        if self._rpc_supports(provider, "anvil_nodeInfo") or self._rpc_supports(provider, "anvil_reset"):
+            return "anvil"
+        if self._rpc_supports(provider, "hardhat_metadata") or self._rpc_supports(provider, "hardhat_reset"):
+            return "hardhat"
+        return "unknown"
+
+    def _ensure_allowance(
+        self,
+        web3: Web3,
+        owner: str,
+        token: str,
+        spender: str,
+        amount_wei: int,
+        priv_key: Optional[str],
+        use_local_signing: bool,
+    ) -> None:
+        erc20 = web3.eth.contract(address=Web3.to_checksum_address(token), abi=ERC20_ABI)
+        cur = int(erc20.functions.allowance(owner, spender).call())
+        if cur >= amount_wei:
+            return
+
+        tx = erc20.functions.approve(spender, amount_wei).build_transaction({
+            "from": owner,
+            "nonce": web3.eth.get_transaction_count(owner),
+        })
+
+        tx.setdefault("gas", 120000)
+
+        if use_local_signing:
+            signed = Account.sign_transaction(tx, priv_key)  # type: ignore[arg-type]
+            raw = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
+            h = web3.eth.send_raw_transaction(raw)
+        else:
+            h = web3.eth.send_transaction(tx)
+
+        web3.eth.wait_for_transaction_receipt(h)

@@ -35,7 +35,7 @@ export DEMO_BINANCE_STARTING_QUOTE_BALANCE="${DEMO_BINANCE_STARTING_QUOTE_BALANC
 export DEMO_BINANCE_FEE_RATE="${DEMO_BINANCE_FEE_RATE:-0.0004}"
 export DEMO_BINANCE_DEFAULT_SLIPPAGE_BPS="${DEMO_BINANCE_DEFAULT_SLIPPAGE_BPS:-1.0}"
 
-export DEMO_BINANCE_API_KEY="${DEMO_BINANCE_API_KEY:-}"
+export DEMO_BINANCE_SPOT_API_KEY="${DEMO_BINANCE_SPOT_API_KEY:-}"
 export DEMO_BINANCE_API_SECRET="${DEMO_BINANCE_API_SECRET:-}"
 export DEMO_BINANCE_BASE_URL="${DEMO_BINANCE_BASE_URL:-https://testnet.binance.vision}"
 export DEMO_BINANCE_RECV_WINDOW_MS="${DEMO_BINANCE_RECV_WINDOW_MS:-5000}"
@@ -44,10 +44,10 @@ export DEMO_BINANCE_USE_TESTNET_EXECUTION="${DEMO_BINANCE_USE_TESTNET_EXECUTION:
 
 # Optional: Spot Testnet credentials (not used by the current demo client,
 # but kept for future wiring)
-if [[ -n "${DEMO_BINANCE_API_KEY:-}" && -n "${DEMO_BINANCE_API_SECRET:-}" ]]; then
+if [[ -n "${DEMO_BINANCE_SPOT_API_KEY:-}" && -n "${DEMO_BINANCE_API_SECRET:-}" ]]; then
   echo "[Binance demo] Testnet API key/secret detected → will try testnet REST calls"
 else
-  echo "[Binance demo] DEMO_BINANCE_API_KEY/SECRET not set → running in pure in-memory mode"
+  echo "[Binance demo] DEMO_BINANCE_SPOT_API_KEY/SECRET not set → running in pure in-memory mode"
 fi
 
 export DEMO_BINANCE_BASE_URL="${DEMO_BINANCE_BASE_URL:-https://testnet.binance.vision}"

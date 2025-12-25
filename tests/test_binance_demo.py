@@ -34,7 +34,7 @@ REQUIRED_ENVS = [
 MISSING_ENVS = [name for name in REQUIRED_ENVS if not os.getenv(name)]
 
 print("[Binance demo env check]")
-for name in REQUIRED_ENVS + ["DEMO_BINANCE_API_KEY", "DEMO_BINANCE_API_SECRET"]:
+for name in REQUIRED_ENVS + ["DEMO_BINANCE_SPOT_API_KEY", "DEMO_BINANCE_API_SECRET"]:
     raw = os.getenv(name)
     # Do not print secrets in clear text
     if "SECRET" in name or "API_KEY" in name:
@@ -235,7 +235,7 @@ async def _run_binance_demo_test() -> None:
 
     # Demo parameters for Binance TESTNET REST API (used only if execution enabled)
     params = BinanceDemoParams(
-        api_key=os.getenv("DEMO_BINANCE_API_KEY", ""),
+        api_key=os.getenv("DEMO_BINANCE_SPOT_API_KEY", ""),
         api_secret=os.getenv("DEMO_BINANCE_API_SECRET", ""),
         base_url=os.getenv("DEMO_BINANCE_BASE_URL", "https://testnet.binance.vision"),
         recv_window_ms=int(os.getenv("DEMO_BINANCE_RECV_WINDOW_MS", "5000")),

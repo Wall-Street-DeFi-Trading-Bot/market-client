@@ -1,6 +1,6 @@
-# scripts/run_arbitrage_demo.py
+#!/usr/bin/env python3
 """
-CLI entrypoint to run the demo-trading arbitrage example.
+CLI entrypoint to run the DEMO arbitrage bot.
 
 Usage:
     python scripts/run_arbitrage_demo.py

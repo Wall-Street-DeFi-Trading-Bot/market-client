@@ -1,20 +1,11 @@
 # src/market_data_client/arbitrage/bot.py
-"""
-High-level arbitrage bot orchestration.
-
-This wires together:
-- MarketDataClient (price/fee/slippage feed)
-- ArbitrageDetector (finding opportunities)
-- ExchangeClient implementations (live / paper)
-- RiskManager + TradeExecutor
-"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..market_data_client import CexConfig, DexConfig, MarketDataClient
 from .arbitrage_detector import ArbitrageDetector, ArbitrageOpportunity
@@ -22,12 +13,13 @@ from .config import BotConfig, ExecutionMode
 from .exchange import (
     BinanceExchangeClient,
     BinanceDemoExchangeClient,
+    BinanceDemoParams,
     ExchangeClient,
     PaperExchangeClient,
     PancakeSwapExchangeClient,
     PancakeSwapDemoExchangeClient,
+    PancakeDemoParams,
 )
-from .exchange import BinanceDemoParams, PancakeDemoParams
 from .executor import TradeExecutor
 from .risk import RiskManager
 from .state import BotState
@@ -37,17 +29,80 @@ logger.setLevel(logging.INFO)
 
 if not logger.handlers:
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
     logger.addHandler(handler)
 
 
-def _build_market_data_client(config: BotConfig, symbol_mapping: Optional[Dict[str, Dict[str, str]]] = None) -> MarketDataClient:
+def _log_demo_trade(trade: Any) -> None:
     """
-    Create a MarketDataClient similar to run_arbitrage_detector, but reusable for the bot.
+    Log DEMO trade metadata in a compact, human-friendly way.
     """
+    meta = getattr(trade, "metadata", None) or {}
+
+    ex = getattr(trade, "exchange", "?")
+    inst = getattr(trade, "instrument", "?")
+    sym = getattr(trade, "symbol", "?")
+    side = getattr(trade, "side", "?")
+    qty = getattr(trade, "quantity", None)
+    px = getattr(trade, "price", None)
+
+    logger.info(
+        "trade executed exchange=%s instrument=%s symbol=%s side=%s qty=%s price=%s",
+        ex,
+        inst,
+        sym,
+        getattr(side, "value", side),
+        f"{qty:.8f}" if isinstance(qty, (int, float)) else str(qty),
+        f"{px:.8f}" if isinstance(px, (int, float)) else str(px),
+    )
+
+    if "binance_demo" in meta:
+        b = meta["binance_demo"]
+        logger.info(
+            "binance_demo theoretical_price=%s execution_price=%s slippage_bps=%s fee_rate=%s",
+            b.get("theoretical_price"),
+            b.get("execution_price"),
+            b.get("slippage_bps"),
+            b.get("fee_rate"),
+        )
+
+    if "binance_testnet" in meta:
+        t = meta["binance_testnet"]
+        logger.info(
+            "binance_testnet status=%s endpoint=%s",
+            t.get("status"),
+            t.get("endpoint"),
+        )
+
+    if "binance_testnet_error" in meta:
+        logger.info("binance_testnet_error %s", meta["binance_testnet_error"])
+
+    if "pancake_demo" in meta:
+        p = meta["pancake_demo"]
+        avg_fill = p.get("avg_fill_price")
+        avg_ret = p.get("avg_return_vs_hint")
+        logger.info("pancake_demo avg_fill_price=%s avg_return_vs_hint=%s", avg_fill, avg_ret)
+
+        per_block = p.get("per_block_results") or []
+        for r in per_block:
+            logger.info(
+                "pancake_block fork_block=%s status=%s fill_price=%s return_vs_hint=%s tx_hash=%s",
+                r.get("fork_block"),
+                r.get("status"),
+                r.get("fill_price"),
+                r.get("return_vs_hint"),
+                r.get("tx_hash"),
+            )
+
+
+def _build_market_data_client(
+    config: BotConfig, symbol_mapping: Optional[Dict[str, Dict[str, str]]] = None
+) -> MarketDataClient:
     symbols = config.symbols
     exchanges = config.exchanges
     symbol_mapping = symbol_mapping or {}
@@ -55,7 +110,6 @@ def _build_market_data_client(config: BotConfig, symbol_mapping: Optional[Dict[s
     cex_configs: List[CexConfig] = []
     dex_configs: List[DexConfig] = []
 
-    # Group CEX exchanges by name
     cex_by_exchange: Dict[str, Dict[str, set]] = {}
     for exchange, instrument in exchanges:
         if instrument != "swap":
@@ -71,15 +125,11 @@ def _build_market_data_client(config: BotConfig, symbol_mapping: Optional[Dict[s
             want=("tick", "funding", "fee", "volume"),
         )
         cex_configs.append(cfg)
-        logger.info(
-            f"[BOT] CEX Config: {exchange} - symbols={cfg.symbols}, instruments={cfg.instruments}"
-        )
 
-    # Group DEX exchanges by (exchange, chain)
     dex_by_exchange: Dict[Tuple[str, str], Dict[str, set]] = {}
     for exchange, instrument in exchanges:
         if instrument == "swap":
-            key = (exchange, "BSC")  # default chain
+            key = (exchange, "BSC")
             if key not in dex_by_exchange:
                 dex_by_exchange[key] = {"pairs": set()}
 
@@ -97,11 +147,8 @@ def _build_market_data_client(config: BotConfig, symbol_mapping: Optional[Dict[s
             want=("tick", "slippage", "fee", "volume"),
         )
         dex_configs.append(cfg)
-        logger.info(
-            f"[BOT] DEX Config: {exchange}({chain}) - pairs={cfg.pairs}"
-        )
 
-    client = MarketDataClient(
+    return MarketDataClient(
         nats_url=config.nats_url,
         use_jetstream=False,
         cex=cex_configs or None,
@@ -109,20 +156,6 @@ def _build_market_data_client(config: BotConfig, symbol_mapping: Optional[Dict[s
         enable_csv=config.enable_csv,
     )
 
-    return client
-
-
-# src/market_data_client/arbitrage/bot.py
-from .config import BotConfig, ExecutionMode
-from .exchange import (
-    BinanceExchangeClient,
-    BinanceDemoExchangeClient,
-    ExchangeClient,
-    PaperExchangeClient,
-    PancakeSwapExchangeClient,
-    PancakeSwapDemoExchangeClient,
-)
-from .state import BotState
 
 def _build_exchange_clients(
     config: BotConfig,
@@ -130,16 +163,8 @@ def _build_exchange_clients(
     demo_binance: Optional[Dict[Tuple[str, str], BinanceDemoParams]] = None,
     demo_pancake: Optional[Dict[Tuple[str, str], PancakeDemoParams]] = None,
 ) -> Dict[Tuple[str, str], ExchangeClient]:
-    """
-    Build ExchangeClient instances for all (exchange, instrument) pairs
-    defined in the bot configuration.
-
-    In DEMO mode, external dependencies (web3, router, testnet keys, ...)
-    are passed in via demo_binance / demo_pancake.
-    """
     clients: Dict[Tuple[str, str], ExchangeClient] = {}
 
-    # Initialize balances for PAPER / DEMO modes
     if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
         for (ex, inst), balances in config.paper_initial_balances.items():
             account = state.get_or_create_account(ex, inst)
@@ -150,76 +175,38 @@ def _build_exchange_clients(
         key = (ex, inst)
 
         if config.mode == ExecutionMode.PAPER:
-            client = PaperExchangeClient(name=ex, instrument=inst, state=state)
-            clients[key] = client
-            logger.info(f"[BOT] Using PAPER client for {ex}({inst})")
+            clients[key] = PaperExchangeClient(name=ex, instrument=inst, state=state)
+
         elif config.mode == ExecutionMode.LIVE:
             if ex == "Binance":
-                client = BinanceExchangeClient(
-                    name=ex,
-                    instrument=inst,
-                    state=state,
-                )
-                clients[key] = client
-                logger.info(f"[BOT] Using LIVE Binance client for {ex}({inst})")
-
+                clients[key] = BinanceExchangeClient(name=ex, instrument=inst, state=state)
             elif ex in ("PancakeSwapV2", "PancakeSwapV3"):
-                client = PancakeSwapExchangeClient(
-                    name=ex,
-                    instrument=inst,
-                    state=state,
-                )
-                clients[key] = client
-                logger.info(f"[BOT] Using LIVE {ex} client for {inst}")
-
+                clients[key] = PancakeSwapExchangeClient(name=ex, instrument=inst, state=state)
             else:
                 raise ValueError(f"LIVE mode does not support exchange {ex}")
 
         elif config.mode == ExecutionMode.DEMO:
             if ex == "Binance":
                 if demo_binance is None or key not in demo_binance:
-                    raise ValueError(
-                        f"DEMO mode: missing BinanceDemoParams for {ex}({inst})"
-                    )
-                params = demo_binance[key]
-                client = BinanceDemoExchangeClient(
+                    raise ValueError(f"DEMO mode: missing BinanceDemoParams for {ex}({inst})")
+                clients[key] = BinanceDemoExchangeClient(
                     name=ex,
                     instrument=inst,
                     state=state,
-                    params=params,
+                    params=demo_binance[key],
                 )
-                clients[key] = client
-                logger.info(f"[BOT] Using DEMO Binance client for {ex}({inst})")
 
             elif ex in ("PancakeSwapV2", "PancakeSwapV3"):
                 if demo_pancake is None or key not in demo_pancake:
-                    raise ValueError(
-                        f"DEMO mode: missing PancakeDemoParams for {ex}({inst})"
-                    )
-                params = demo_pancake[key]
-                client = PancakeSwapDemoExchangeClient(
+                    raise ValueError(f"DEMO mode: missing PancakeDemoParams for {ex}({inst})")
+                clients[key] = PancakeSwapDemoExchangeClient(
                     exchange_name=ex,
                     instrument=inst,
                     state=state,
-                    params=params,
+                    params=demo_pancake[key],
                 )
-                clients[key] = client
-                logger.info(f"[BOT] Using DEMO {ex} client (forked chain)")
-
             else:
-                # For other exchanges in DEMO mode fallback to paper client
-                fee_rate = 0.0005
-                client = PaperExchangeClient(
-                    name=ex,
-                    instrument=inst,
-                    state=state,
-                    fee_rate=fee_rate,
-                )
-                clients[key] = client
-                logger.info(
-                    f"[BOT] Using PaperExchangeClient for {ex}({inst}) in DEMO mode "
-                    f"(no special demo client configured)"
-                )
+                clients[key] = PaperExchangeClient(name=ex, instrument=inst, state=state, fee_rate=0.0005)
 
         else:
             raise ValueError(f"Unsupported execution mode: {config.mode}")
@@ -228,21 +215,50 @@ def _build_exchange_clients(
 
 
 def _total_usdt_equity(state: BotState) -> float:
-    """
-    Sum all USDT balances across all paper accounts.
-
-    Assumes arbitrage keeps you roughly flat in base asset,
-    so total equity can be approximated by total USDT.
-    """
     total = 0.0
-    for (_, _), account in state.accounts.items():
-        # account.balances is assumed to be { "USDT": float, "BNB": float, ... }
-        usdt = account.balances.get("USDT", 0.0)
-        try:
-            total += float(usdt)
-        except (TypeError, ValueError):
-            continue
+    for account in state.accounts.values():
+        total += float(account.balances.get("USDT", 0.0) or 0.0)
     return total
+
+def _format_table(headers: List[str], rows: List[List[str]]) -> str:
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, c in enumerate(r):
+            widths[i] = max(widths[i], len(c))
+
+    def fmt_row(r: List[str]) -> str:
+        return " | ".join(r[i].ljust(widths[i]) for i in range(len(headers)))
+
+    sep = "-+-".join("-" * w for w in widths)
+    out = [fmt_row(headers), sep]
+    out.extend(fmt_row(r) for r in rows)
+    return "\n".join(out)
+
+
+def _balances_table(state: BotState, config: BotConfig) -> str:
+    rows: List[List[str]] = []
+
+    for (ex, inst), account in sorted(state.accounts.items(), key=lambda x: (x[0][0], x[0][1])):
+        initial_bal = config.paper_initial_balances.get((ex, inst), {})
+        current_bal = account.balances
+
+        assets = sorted(set(initial_bal.keys()) | set(current_bal.keys()))
+        for asset in assets:
+            init = float(initial_bal.get(asset, 0.0) or 0.0)
+            final = float(current_bal.get(asset, 0.0) or 0.0)
+            delta = final - init
+
+            rows.append([
+                ex,
+                inst,
+                asset,
+                f"{init:.8f}",
+                f"{final:.8f}",
+                f"{delta:.8f}",
+            ])
+
+    headers = ["exchange", "instrument", "asset", "initial", "final", "delta"]
+    return _format_table(headers, rows)
 
 
 async def run_arbitrage_bot(
@@ -252,38 +268,12 @@ async def run_arbitrage_bot(
     demo_binance_params: Optional[Dict[Tuple[str, str], BinanceDemoParams]] = None,
     demo_pancake_params: Optional[Dict[Tuple[str, str], PancakeDemoParams]] = None,
 ) -> None:
-    """
-    Main entry point to run the arbitrage bot (PAPER or LIVE).
+    logger.info("Starting arbitrage bot mode=%s symbols=%s", config.mode.value, ",".join(config.symbols))
 
-    Steps:
-      1. Build MarketDataClient and start it.
-      2. Create ArbitrageDetector.
-      3. Build ExchangeClients (paper or live).
-      4. Build RiskManager and TradeExecutor.
-      5. In a loop:
-           - scan opportunities
-           - execute selected ones
-           - track paper PnL (in PAPER mode)
-    """
-    logger.info("=" * 80)
-    logger.info("Starting Arbitrage Bot")
-    logger.info("=" * 80)
-    logger.info(f"  Mode: {config.mode.value}")
-    logger.info(f"  Symbols: {', '.join(config.symbols)}")
-    logger.info(
-        f"  Exchanges: {', '.join([f'{ex}({inst})' for ex, inst in config.exchanges])}"
-    )
-    logger.info(f"  Min profit: {config.min_profit_pct}%")
-    logger.info(f"  Trade notional: {config.trade_notional_usd} USDT")
-    logger.info(f"  Scan interval: {config.scan_interval}s")
-    logger.info("=" * 80)
-
-    # 1) Market data client
     client = _build_market_data_client(config, symbol_mapping)
     await client.start()
-    logger.info("[BOT] MarketDataClient started")
+    logger.info("MarketDataClient started")
 
-    # 2) Detector
     detector = ArbitrageDetector(
         client=client,
         min_profit_pct=config.min_profit_pct,
@@ -292,7 +282,6 @@ async def run_arbitrage_bot(
         symbol_mapping=symbol_mapping or {},
     )
 
-    # 3) State + exchange clients
     state = BotState()
     exchange_clients = _build_exchange_clients(
         config=config,
@@ -301,127 +290,88 @@ async def run_arbitrage_bot(
         demo_pancake=demo_pancake_params,
     )
 
-    initial_equity_usdt: float = 0.0
-    total_realized_pnl_usdt: float = 0.0
-    total_trades_executed: int = 0
+    initial_equity_usdt = 0.0
+    total_realized_pnl_usdt = 0.0
+    total_trades_executed = 0
 
     if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
         initial_equity_usdt = _total_usdt_equity(state)
-        mode_label = "PAPER" if config.mode == ExecutionMode.PAPER else "DEMO"
-        logger.info(
-            f"[BOT] {mode_label} initial equity (USDT): {initial_equity_usdt:.4f}"
-        )
+        logger.info("Initial equity_usdt=%s", f"{initial_equity_usdt:.6f}")
 
-    # 4) Risk + executor
     risk = RiskManager(config=config)
     executor = TradeExecutor(exchange_clients=exchange_clients, risk_manager=risk)
 
     try:
         scan_count = 0
         while True:
-
             if stop_event is not None and stop_event.is_set():
-                logger.info("[BOT] Stop event set, breaking scan loop.")
+                logger.info("Stop event set. Exiting scan loop.")
                 break
 
             scan_count += 1
-            logger.info("\n" + "=" * 80)
-            logger.info(
-                f"[BOT] Scan #{scan_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-            logger.info("=" * 80)
+            logger.info("scan=%s time=%s", scan_count, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
             opportunities: List[ArbitrageOpportunity] = await detector.scan_opportunities()
 
             if not opportunities:
-                logger.info("[BOT] No profitable opportunities this round.")
-            else:
-                # Sort by net profit descending
-                opportunities.sort(key=lambda o: o.net_profit_pct, reverse=True)
+                await asyncio.sleep(config.scan_interval)
+                continue
 
-                for opp in opportunities:
-                    equity_before = None
-                    if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
-                        equity_before = _total_usdt_equity(state)
+            opportunities.sort(key=lambda o: o.net_profit_pct, reverse=True)
 
-                    try:
-                        await executor.execute_opportunity(opp)
-                    except ValueError as e:
-                        logger.info("[BOT] Execution failed for %s: %s", opp.symbol, e)
-                        continue
-                    except Exception as exc:
-                        logger.warning(f"[BOT] Failed to execute opportunity: {exc}")
-                        continue
+            for opp in opportunities:
+                equity_before = (
+                    _total_usdt_equity(state)
+                    if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO)
+                    else None
+                )
+                trades_before = len(state.executed_trades)
 
-                    if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
-                        equity_after = _total_usdt_equity(state)
-                        pnl = equity_after - (equity_before or 0.0)
-                        pnl_pct = 0.0
-                        if equity_before and equity_before > 0:
-                            pnl_pct = pnl / equity_before * 100.0
+                try:
+                    await executor.execute_opportunity(opp)
+                except Exception as exc:
+                    logger.info("execution failed symbol=%s error=%s", opp.symbol, str(exc))
+                    continue
 
-                        total_realized_pnl_usdt += pnl
-                        total_trades_executed += 1
+                new_trades = state.executed_trades[trades_before:]
+                for t in new_trades:
+                    _log_demo_trade(t)
 
-                        logger.info(
-                            "[BOT] PAPER trade executed:\n"
-                            f"  Symbol        : {opp.symbol}\n"
-                            f"  Path          : BUY {opp.buy_exchange}({opp.buy_instrument}) "
-                            f"-> SELL {opp.sell_exchange}({opp.sell_instrument})\n"
-                            f"  Theoretical   : {opp.net_profit_pct:.3f}% "
-                            f"on {config.trade_notional_usd:.2f} USDT "
-                            f"(≈ {config.trade_notional_usd * opp.net_profit_pct / 100.0:.4f} USDT)\n"
-                            f"  Equity (USDT) : {equity_before:.4f} -> {equity_after:.4f} "
-                            f"(Δ={pnl:.4f} USDT, {pnl_pct:.3f}%)"
-                        )
+                if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
+                    equity_after = _total_usdt_equity(state)
+                    pnl = equity_after - float(equity_before or 0.0)
+                    total_realized_pnl_usdt += pnl
+                    total_trades_executed += 1
 
-            logger.info(f"[BOT] Sleeping {config.scan_interval}s before next scan...")
+                    logger.info(
+                        "trade_summary symbol=%s path=BUY %s(%s)->SELL %s(%s) theo_net=%s pnl_usdt=%s equity_usdt=%s",
+                        opp.symbol,
+                        opp.buy_exchange,
+                        opp.buy_instrument,
+                        opp.sell_exchange,
+                        opp.sell_instrument,
+                        f"{opp.net_profit_pct:.6f}",
+                        f"{pnl:.6f}",
+                        f"{equity_after:.6f}",
+                    )
             await asyncio.sleep(config.scan_interval)
-    
+
     finally:
         await client.stop()
-        logger.info("[BOT] MarketDataClient stopped")
+        logger.info("MarketDataClient stopped")
 
         if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
-            logger.info("\n" + "=" * 80)
-            logger.info("[BOT] PAPER trading summary")
-            logger.info("=" * 80)
-            logger.info(f"Total paper trades executed: {total_trades_executed}")
-
-            # Per-account balance comparison: initial vs final
-            for key, account in state.accounts.items():
-                ex, inst = key
-                initial_bal = config.paper_initial_balances.get(key, {})  # 초기 잔고
-                current_bal = account.balances                             # 최종 잔고
-
-                logger.info(f"\nAccount {ex}({inst}) balance changes:")
-                logger.info(f"{'Asset':<8} {'Initial':>14} {'Final':>14} {'Δ':>14}")
-                logger.info("-" * 54)
-
-                asset_set = set(initial_bal.keys()) | set(current_bal.keys())
-                for asset in sorted(asset_set):
-                    init = float(initial_bal.get(asset, 0.0) or 0.0)
-                    final = float(current_bal.get(asset, 0.0) or 0.0)
-                    delta = final - init
-                    logger.info(
-                        f"{asset:<8} {init:>14.6f} {final:>14.6f} {delta:>14.6f}"
-                    )
-
             final_equity_usdt = _total_usdt_equity(state)
-            logger.info("\n--- Equity summary (USDT only) ---")
-            logger.info(f"Initial USDT equity : {initial_equity_usdt:.4f} USDT")
-            logger.info(f"Final   USDT equity : {final_equity_usdt:.4f} USDT")
-            logger.info(
-                f"Realized PnL (USDT) : {total_realized_pnl_usdt:.4f} USDT "
-                f"(by equity delta)"
-            )
+            roi_pct = 0.0
+            if initial_equity_usdt > 0:
+                roi_pct = (final_equity_usdt - initial_equity_usdt) / initial_equity_usdt * 100.0
 
-            if initial_equity_usdt > 0.0:
-                total_roi_pct = (
-                    (final_equity_usdt - initial_equity_usdt)
-                    / initial_equity_usdt
-                    * 100.0
-                )
-                logger.info(f"Total ROI           : {total_roi_pct:.3f}%")
-            logger.info("=" * 80)
+            logger.info("final_summary mode=%s trades=%s", config.mode.value, total_trades_executed)
+            logger.info("equity_usdt initial=%s final=%s pnl=%s roi_pct=%s",
+                        f"{initial_equity_usdt:.6f}",
+                        f"{final_equity_usdt:.6f}",
+                        f"{(final_equity_usdt - initial_equity_usdt):.6f}",
+                        f"{roi_pct:.6f}")
 
+            table = _balances_table(state, config)
+            logger.info("balances:\n%s", table)
