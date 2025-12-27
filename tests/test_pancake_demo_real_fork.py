@@ -420,119 +420,118 @@ def _ensure_allowance(
     amount_in: int,
     private_key: str,
 ) -> None:
-    """Ensure allowances for Universal Router demo.
+    """
+    Ensure allowances for Universal Router using Permit2.
 
     This sets:
-      - ERC20 allowance: trader -> Permit2
-      - ERC20 allowance: trader -> router (for direct pulls)
-      - Permit2 allowance: trader/token_in -> router
+      1) ERC20 allowance: owner(trader) -> spender(Permit2)
+      2) Permit2 allowance: owner(trader), token(token_in) -> spender(router)
     """
+
     permit2_addr = Web3.to_checksum_address(permit2_address)
     router_addr = Web3.to_checksum_address(router_address)
+    trader_addr = Web3.to_checksum_address(trader)
+    token_addr = Web3.to_checksum_address(token_in)
 
-    token_contract = web3.eth.contract(address=token_in, abi=ERC20_ABI)
+    token_contract = web3.eth.contract(address=token_addr, abi=ERC20_ABI)
     permit2 = web3.eth.contract(address=permit2_addr, abi=PERMIT2_ABI)
 
     gas_price_gwei = int(os.getenv("DEMO_PANCAKE_GAS_PRICE_GWEI", "3"))
     gas_price = web3.to_wei(gas_price_gwei, "gwei")
-    nonce = web3.eth.get_transaction_count(trader)
 
-    max_uint256 = 2**256 - 1
-    max_uint160 = 2**160 - 1
-    now_ts = int(time.time())
-    max_expiration = 2**48 - 1
-    desired_exp = min(max_expiration, now_ts + 10 * 365 * 24 * 60 * 60)
+    # Use chain time to avoid issues on fork reset / block timestamp changes.
+    now_ts = int(web3.eth.get_block("latest")["timestamp"])
 
-    # 1) ERC20 allowance trader -> Permit2
+    max_uint256 = (1 << 256) - 1
+    max_uint160 = (1 << 160) - 1
+    max_expiration_uint48 = (1 << 48) - 1  # uint48 max
+
+    # Best-effort: verify router's Permit2 address matches (if ABI exposes it).
     try:
-        erc20_allowance_permit2 = token_contract.functions.allowance(
-            trader, permit2_addr
-        ).call()
-    except Exception:
-        erc20_allowance_permit2 = 0
+        router_abi_path = Path(os.environ["DEMO_PANCAKE_ROUTER_ABI_JSON"])
+        router_abi = json.loads(router_abi_path.read_text(encoding="utf-8"))
+        router_contract = web3.eth.contract(address=router_addr, abi=router_abi)
 
-    if erc20_allowance_permit2 < amount_in:
-        approve_permit2_tx = token_contract.functions.approve(
-            permit2_addr,
-            max_uint256,
-        ).build_transaction(
+        # Some router ABIs expose PERMIT2() as a view function.
+        if hasattr(router_contract.functions, "PERMIT2"):
+            router_permit2 = router_contract.functions.PERMIT2().call()
+            if Web3.to_checksum_address(router_permit2) != permit2_addr:
+                raise ValueError(
+                    f"Permit2 mismatch: router={router_permit2}, env={permit2_addr}"
+                )
+    except Exception:
+        # Non-fatal; continue.
+        pass
+
+    nonce = web3.eth.get_transaction_count(trader_addr)
+
+    # 1) ERC20 approve: trader -> Permit2
+    try:
+        erc20_allowance = int(token_contract.functions.allowance(trader_addr, permit2_addr).call())
+    except Exception:
+        erc20_allowance = 0
+
+    if erc20_allowance < amount_in:
+        # Some tokens (e.g., USDT-like) may require resetting allowance to 0 first.
+        if erc20_allowance != 0:
+            try:
+                tx0 = token_contract.functions.approve(permit2_addr, 0).build_transaction(
+                    {
+                        "from": trader_addr,
+                        "gas": 200_000,
+                        "gasPrice": gas_price,
+                        "nonce": nonce,
+                    }
+                )
+                signed0 = web3.eth.account.sign_transaction(tx0, private_key)
+                h0 = web3.eth.send_raw_transaction(signed0.raw_transaction)
+                web3.eth.wait_for_transaction_receipt(h0)
+                nonce += 1
+            except Exception:
+                # Best-effort; continue to the next approve.
+                pass
+
+        tx1 = token_contract.functions.approve(permit2_addr, max_uint256).build_transaction(
             {
-                "from": trader,
+                "from": trader_addr,
                 "gas": 200_000,
                 "gasPrice": gas_price,
                 "nonce": nonce,
             }
         )
+        signed1 = web3.eth.account.sign_transaction(tx1, private_key)
+        h1 = web3.eth.send_raw_transaction(signed1.raw_transaction)
+        web3.eth.wait_for_transaction_receipt(h1)
         nonce += 1
 
-        signed = web3.eth.account.sign_transaction(
-            approve_permit2_tx, private_key
-        )
-        tx_hash = web3.eth.send_raw_transaction(signed.raw_transaction)
-        web3.eth.wait_for_transaction_receipt(tx_hash)
-
-    # 1-b) ERC20 allowance trader -> router (for direct pull from trader)
+    # 2) Permit2 allowance: (owner=trader, token=token_in) -> spender(router)
     try:
-        erc20_allowance_router = token_contract.functions.allowance(
-            trader, router_addr
-        ).call()
+        res = permit2.functions.allowance(trader_addr, token_addr, router_addr).call()
+        allowed_amount = int(res[0])  # uint160
+        expiration = int(res[1])      # uint48
+        # res[2] is nonce in Permit2 struct; not needed here
     except Exception:
-        erc20_allowance_router = 0
+        allowed_amount, expiration = 0, 0
 
-    if erc20_allowance_router < amount_in:
-        approve_router_tx = token_contract.functions.approve(
-            router_addr,
-            max_uint256,
-        ).build_transaction(
-            {
-                "from": trader,
-                "gas": 200_000,
-                "gasPrice": gas_price,
-                "nonce": nonce,
-            }
-        )
-        nonce += 1
-
-        signed = web3.eth.account.sign_transaction(
-            approve_router_tx, private_key
-        )
-        tx_hash = web3.eth.send_raw_transaction(signed.raw_transaction)
-        web3.eth.wait_for_transaction_receipt(tx_hash)
-
-    # 2) Permit2 allowance trader -> router
-    try:
-        res = permit2.functions.allowance(trader, token_in, router_addr).call()
-        # struct PermitDetails { uint160 amount; uint48 expiration; uint48 nonce; }
-        if isinstance(res, (list, tuple)):
-            allowed_amount = int(res[0])
-            expiration = int(res[1])
-        else:
-            allowed_amount = 0
-            expiration = 0
-    except Exception:
-        allowed_amount = 0
-        expiration = 0
-
-    need_permit2 = allowed_amount < amount_in or expiration <= now_ts
+    need_permit2 = (allowed_amount < amount_in) or (expiration <= now_ts)
 
     if need_permit2:
-        permit2_tx = permit2.functions.approve(
-            token_in,
+        tx2 = permit2.functions.approve(
+            token_addr,
             router_addr,
             max_uint160,
-            desired_exp,
+            max_expiration_uint48,  # never expires (uint48 max)
         ).build_transaction(
             {
-                "from": trader,
+                "from": trader_addr,
                 "gas": 200_000,
                 "gasPrice": gas_price,
                 "nonce": nonce,
             }
         )
-
-        signed = web3.eth.account.sign_transaction(permit2_tx, private_key)
-        tx_hash = web3.eth.send_raw_transaction(signed.raw_transaction)
-        web3.eth.wait_for_transaction_receipt(tx_hash)
+        signed2 = web3.eth.account.sign_transaction(tx2, private_key)
+        h2 = web3.eth.send_raw_transaction(signed2.raw_transaction)
+        web3.eth.wait_for_transaction_receipt(h2)
 
 
 async def _get_price_hint_from_market_data(side: str) -> Optional[float]:

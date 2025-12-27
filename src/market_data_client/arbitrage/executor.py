@@ -93,14 +93,7 @@ class TradeExecutor:
             opp.sell_price,
             qty,
         )
-        if hasattr(buy_trade, "success") and not getattr(buy_trade, "success"):
-            logger.warning(
-                "[EXECUTOR] BUY leg failed for %s on %s(%s): %s | %s",
-                opp.symbol, opp.buy_exchange, opp.buy_instrument,
-                getattr(buy_trade, "message", "success == False"),
-                _summarize_pancake_reverts(buy_trade),
-            )
-            raise ValueError("BUY leg failed (success == False)")
+
         # BUY leg
         try:
             buy_trade = await buy_client.create_market_order(
@@ -140,13 +133,15 @@ class TradeExecutor:
 
         if hasattr(buy_trade, "success") and not getattr(buy_trade, "success"):
             logger.warning(
-                "[EXECUTOR] BUY leg failed for %s on %s(%s): %s",
+                "[EXECUTOR] BUY leg failed for %s on %s(%s): %s | %s",
                 opp.symbol,
                 opp.buy_exchange,
                 opp.buy_instrument,
                 getattr(buy_trade, "message", "success == False"),
+                self._summarize_pancake_reverts(buy_trade),
             )
             raise ValueError("BUY leg failed (success == False)")
+
 
         # SELL leg
         try:
@@ -205,15 +200,24 @@ class TradeExecutor:
 
         return buy_trade, sell_trade
 
+    @staticmethod
     def _summarize_pancake_reverts(trade: TradeResult) -> str:
+        """
+        Summarize per-block revert reasons from Pancake demo metadata.
+        """
         meta = (trade.metadata or {}).get("pancake_demo") or {}
         rows = meta.get("per_block_results") or []
         fails = [r for r in rows if int(r.get("status", 0) or 0) != 1]
+
         if not fails:
             return "no per-block failures"
+
         parts = []
         for r in fails[:5]:
+            reason = r.get("revert_reason")
+            if isinstance(reason, str) and len(reason) > 180:
+                reason = reason[:180] + "..."
             parts.append(
-                f"block={r.get('fork_block')} status={r.get('status')} reason={r.get('revert_reason')}"
+                f"block={r.get('fork_block')} status={r.get('status')} reason={reason}"
             )
         return " | ".join(parts)

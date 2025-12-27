@@ -235,12 +235,20 @@ async def _run_binance_demo_test() -> None:
 
     # Demo parameters for Binance TESTNET REST API (used only if execution enabled)
     params = BinanceDemoParams(
-        api_key=os.getenv("DEMO_BINANCE_SPOT_API_KEY", ""),
-        api_secret=os.getenv("DEMO_BINANCE_API_SECRET", ""),
-        base_url=os.getenv("DEMO_BINANCE_BASE_URL", "https://testnet.binance.vision"),
+        # Spot testnet
+        spot_api_key=os.getenv("DEMO_BINANCE_SPOT_API_KEY", ""),
+        spot_api_secret=os.getenv("DEMO_BINANCE_SPOT_API_SECRET", ""),
+        spot_base_url=os.getenv("DEMO_BINANCE_SPOT_BASE_URL", os.getenv("DEMO_BINANCE_BASE_URL", "https://testnet.binance.vision")),
+
+        # Futures testnet
+        futures_api_key=os.getenv("DEMO_BINANCE_FUTURES_API_KEY", ""),
+        futures_api_secret=os.getenv("DEMO_BINANCE_FUTURES_API_SECRET", ""),
+        futures_base_url=os.getenv("DEMO_BINANCE_FUTURES_BASE_URL", "https://testnet.binancefuture.com"),
+
         recv_window_ms=int(os.getenv("DEMO_BINANCE_RECV_WINDOW_MS", "5000")),
         http_timeout_sec=float(os.getenv("DEMO_BINANCE_HTTP_TIMEOUT_SEC", "10.0")),
         use_testnet_execution=os.getenv("DEMO_BINANCE_USE_TESTNET_EXECUTION", "0") != "0",
+        fail_on_testnet_error=os.getenv("DEMO_BINANCE_FAIL_ON_TESTNET_ERROR", "1") != "0",
     )
 
     client = BinanceDemoExchangeClient(

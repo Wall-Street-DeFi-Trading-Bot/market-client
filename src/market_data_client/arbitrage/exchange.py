@@ -16,12 +16,14 @@ from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple, List
-from urllib.parse import urlencode
+from decimal import Decimal, ROUND_DOWN
 
 from hexbytes import HexBytes
 from web3 import Web3
 from .config import ExecutionMode
 from eth_account import Account 
+from market_data_client.arbitrage.pairs import resolve_base_quote
+
 
 # Relax extraData validation for PoA-style chains such as BSC.
 # Web3's default block formatters and validation middleware enforce
@@ -62,6 +64,38 @@ except Exception:
     # If anything above fails, we simply skip the PoA override.
     pass
 
+def _apply_poa_middleware(w3: Web3) -> None:
+    """
+    Inject PoA middleware for chains like BNB Chain / Polygon / geth --dev.
+
+    web3.py v6: geth_poa_middleware
+    web3.py v7+: ExtraDataToPOAMiddleware
+    """
+    # v6 style
+    try:
+        from web3.middleware import geth_poa_middleware
+        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        return
+    except Exception:
+        pass
+
+    # v7 style
+    try:
+        from web3.middleware import ExtraDataToPOAMiddleware
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        return
+    except Exception:
+        pass
+
+    # some installs expose it under proof_of_authority
+    try:
+        from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware  # type: ignore
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        return
+    except Exception:
+        pass
+
+
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +111,8 @@ class OrderSide(str, Enum):
 class OrderType(str, Enum):
     MARKET = "MARKET"
 
+class InsufficientBalanceError(RuntimeError):
+    """Raised when an account does not have enough balance for a simulated trade."""
 
 @dataclass
 class TradeResult:
@@ -396,31 +432,6 @@ class BinanceDemoExchangeClient(ExchangeClient):
             "ENABLED" if self._params.use_testnet_execution else "DISABLED",
         )
 
-    def _get_spot_symbol_filters_sync(self, base_url: str, symbol: str, for_market: bool) -> Dict[str, str]:
-        """
-        Fetch spot symbol filters from /api/v3/exchangeInfo.
-        Uses MARKET_LOT_SIZE for MARKET orders, otherwise LOT_SIZE.
-        """
-        import json as _json
-        from urllib import parse as _parse, request as _request
-
-        url = base_url.rstrip("/") + "/api/v3/exchangeInfo?" + _parse.urlencode({"symbol": symbol})
-        with _request.urlopen(url, timeout=self._params.http_timeout_sec) as resp:
-            raw = resp.read().decode("utf-8")
-
-        data = _json.loads(raw)
-        info = data["symbols"][0]
-        filt_map = {f["filterType"]: f for f in info.get("filters", [])}
-
-        ft = "MARKET_LOT_SIZE" if for_market else "LOT_SIZE"
-        lot = filt_map.get(ft) or filt_map.get("LOT_SIZE") or {}
-
-        return {
-            "stepSize": str(lot.get("stepSize", "0")),
-            "minQty": str(lot.get("minQty", "0")),
-            "minNotional": "0",
-        }
-
 
     def _round_step_down_str(self, qty: float, step_size: str) -> str:
         """
@@ -439,32 +450,6 @@ class BinanceDemoExchangeClient(ExchangeClient):
         # Ensure we don't produce scientific notation
         rounded = rounded.quantize(s, rounding=ROUND_DOWN)
         return format(rounded, "f")
-
-    def _get_futures_symbol_filters_sync(self, base_url: str, symbol: str, for_market: bool) -> Dict[str, str]:
-        """
-        Fetch futures symbol filters from /fapi/v1/exchangeInfo.
-        Uses MARKET_LOT_SIZE for MARKET orders, otherwise LOT_SIZE.
-        """
-        import json as _json
-        from urllib import parse as _parse, request as _request
-
-        url = base_url.rstrip("/") + "/fapi/v1/exchangeInfo?" + _parse.urlencode({"symbol": symbol})
-        with _request.urlopen(url, timeout=self._params.http_timeout_sec) as resp:
-            raw = resp.read().decode("utf-8")
-
-        data = _json.loads(raw)
-        info = data["symbols"][0]
-        filt_map = {f["filterType"]: f for f in info.get("filters", [])}
-
-        ft = "MARKET_LOT_SIZE" if for_market else "LOT_SIZE"
-        lot = filt_map.get(ft) or filt_map.get("LOT_SIZE") or {}
-
-        return {
-            "stepSize": str(lot.get("stepSize", "0")),
-            "minQty": str(lot.get("minQty", "0")),
-            "minNotional": "0",
-        }
-
 
     def _get_testnet_symbol_filters_cached(
         self,
@@ -493,10 +478,125 @@ class BinanceDemoExchangeClient(ExchangeClient):
         return filt
 
 
+    def _get_spot_symbol_filters_sync(self, base_url: str, symbol: str, for_market: bool) -> Dict[str, str]:
+        url = base_url.rstrip("/") + "/api/v3/exchangeInfo?" + _parse.urlencode({"symbol": symbol})
+        with _request.urlopen(url, timeout=self._params.http_timeout_sec) as resp:
+            raw = resp.read().decode("utf-8")
 
-    def _normalize_qty_str(self, qty: float, step_size: str, min_qty: str) -> str:
+        data = _json.loads(raw)
+        info = data["symbols"][0]
+        filt_map = {f["filterType"]: f for f in info.get("filters", [])}
+
+        lot = filt_map.get("LOT_SIZE") or {}
+        mlot = filt_map.get("MARKET_LOT_SIZE") or {}
+
+        def _dec(x: Any) -> Decimal:
+            try:
+                return Decimal(str(x))
+            except Exception:
+                return Decimal("0")
+
+        lot_step = _dec(lot.get("stepSize", "0"))
+        mlot_step = _dec(mlot.get("stepSize", "0"))
+        lot_min = _dec(lot.get("minQty", "0"))
+        mlot_min = _dec(mlot.get("minQty", "0"))
+
+        # Pick usable step/min (avoid MARKET_LOT_SIZE=0.00000000 trap)
+        step_candidates = [s for s in (lot_step, mlot_step) if s > 0]
+        min_candidates = [m for m in (lot_min, mlot_min) if m > 0]
+
+        step = max(step_candidates) if step_candidates else Decimal("0")
+        mn = max(min_candidates) if min_candidates else Decimal("0")
+
+        # min notional (best-effort)
+        min_notional = "0"
+        mn_filter = filt_map.get("NOTIONAL") or filt_map.get("MIN_NOTIONAL") or {}
+        if isinstance(mn_filter, dict):
+            min_notional = str(
+                mn_filter.get("minNotional")
+                or mn_filter.get("notional")
+                or mn_filter.get("minNotionalValue")
+                or "0"
+            )
+
+        return {
+            "stepSize": format(step, "f"),
+            "minQty": format(mn, "f"),
+            "minNotional": min_notional,
+            "qtyPrecision": str(info.get("quantityPrecision") or info.get("baseAssetPrecision") or "0"),
+        }
+
+
+
+    def _get_futures_symbol_filters_sync(self, base_url: str, symbol: str, for_market: bool) -> Dict[str, str]:
         """
-        Floor quantity to stepSize and enforce minQty. Returns a plain decimal string.
+        Fetch futures symbol filters from /fapi/v1/exchangeInfo.
+
+        IMPORTANT:
+        Some Binance futures endpoints validate MARKET orders using LOT_SIZE as well.
+        To be safe, we pick the *coarser* stepSize between LOT_SIZE and MARKET_LOT_SIZE.
+        """
+
+        url = base_url.rstrip("/") + "/fapi/v1/exchangeInfo?" + _parse.urlencode({"symbol": symbol})
+        with _request.urlopen(url, timeout=self._params.http_timeout_sec) as resp:
+            raw = resp.read().decode("utf-8")
+
+        data = _json.loads(raw)
+        info = data["symbols"][0]
+        filt_map = {f["filterType"]: f for f in info.get("filters", [])}
+
+        lot = filt_map.get("LOT_SIZE") or {}
+        mlot = filt_map.get("MARKET_LOT_SIZE") or {}
+
+        def _dec(x: Any) -> Decimal:
+            try:
+                return Decimal(str(x))
+            except Exception:
+                return Decimal("0")
+
+        lot_step = _dec(lot.get("stepSize", "0"))
+        mlot_step = _dec(mlot.get("stepSize", "0"))
+        lot_min = _dec(lot.get("minQty", "0"))
+        mlot_min = _dec(mlot.get("minQty", "0"))
+
+        # Choose the coarser (larger) step to satisfy both validators.
+        step = lot_step if lot_step > 0 else mlot_step
+        if lot_step > 0 and mlot_step > 0:
+            step = max(lot_step, mlot_step)
+
+        # Min qty: choose the stricter (larger) minQty if both present.
+        mn = lot_min if lot_min > 0 else mlot_min
+        if lot_min > 0 and mlot_min > 0:
+            mn = max(lot_min, mlot_min)
+
+        qty_prec = info.get("quantityPrecision", None)
+        try:
+            qty_prec = str(int(qty_prec)) if qty_prec is not None else None
+        except Exception:
+            qty_prec = None
+
+        return {
+            "stepSize": format(step, "f"),
+            "minQty": format(mn, "f"),
+            "minNotional": "0",
+            "qtyPrecision": qty_prec or "",
+        }
+
+
+
+    def _normalize_qty_str(
+        self,
+        qty: float,
+        step_size: str,
+        min_qty: str,
+        qty_precision: Optional[int] = None,
+    ) -> str:
+        """
+        Normalize quantity to Binance stepSize/minQty and return a plain decimal string.
+
+        - Floors qty to a multiple of stepSize
+        - Enforces minQty
+        - Formats with <= qty_precision decimals when available
         """
         from decimal import Decimal, ROUND_DOWN
 
@@ -504,18 +604,26 @@ class BinanceDemoExchangeClient(ExchangeClient):
         step = Decimal(str(step_size))
         mn = Decimal(str(min_qty))
 
-        if step <= 0:
-            # No step info; still enforce minQty.
-            q2 = q if q >= mn else mn
-            return format(q2, "f")
+        if step > 0:
+            q2 = (q // step) * step
+        else:
+            q2 = q
 
-        q2 = (q // step) * step
         if q2 < mn:
             return "0"
 
-        # Quantize to step to avoid scientific notation and enforce decimal places.
-        q2 = q2.quantize(step, rounding=ROUND_DOWN)
-        return format(q2, "f")
+        # Decide formatting precision
+        if qty_precision is not None and qty_precision >= 0:
+            decimals = int(qty_precision)
+        else:
+            step_norm = step.normalize() if step > 0 else Decimal("0")
+            decimals = max(0, -step_norm.as_tuple().exponent)
+
+        quant = Decimal("1").scaleb(-decimals)  # 10^-decimals
+        q2 = q2.quantize(quant, rounding=ROUND_DOWN)
+
+        out = format(q2, "f").rstrip("0").rstrip(".")
+        return out or "0"
 
 
     async def create_order(
@@ -689,7 +797,7 @@ class BinanceDemoExchangeClient(ExchangeClient):
             self._params.spot_api_secret or None,
             "spot",
         )
-    
+
     def _send_testnet_order_sync(
         self,
         symbol: str,
@@ -697,14 +805,6 @@ class BinanceDemoExchangeClient(ExchangeClient):
         quantity: float,
         order_type: OrderType,
     ) -> Dict[str, Any]:
-        """
-        Best-effort synchronous helper that sends a MARKET order to Binance testnet REST API.
-
-        - Selects correct endpoint and credentials based on self.instrument.
-        - If credentials are missing, returns status="skipped" (not an error).
-        - Does NOT affect balances or PnL.
-        - Normalizes quantity to stepSize/minQty to avoid precision errors (-1111).
-        """
         base_url, path, api_key, api_secret, mode_label = self._select_testnet_endpoint_and_creds()
 
         if not base_url or not path:
@@ -720,14 +820,60 @@ class BinanceDemoExchangeClient(ExchangeClient):
 
         url = base_url + path
 
-        # Normalize quantity according to exchangeInfo filters (stepSize/minQty)
+        # --- Fetch filters & build candidate qty strings (coarser fallback) ---
         try:
             filters = self._get_testnet_symbol_filters_cached(mode_label, base_url, symbol, order_type)
-            qty_str = self._normalize_qty_str(
-                quantity,
-                filters.get("stepSize", "0"),
-                filters.get("minQty", "0"),
-            )
+            step = Decimal(str(filters.get("stepSize", "0") or "0"))
+            mn = Decimal(str(filters.get("minQty", "0") or "0"))
+
+            q_raw = Decimal(str(quantity))
+
+            # Floor to stepSize first
+            if step > 0:
+                q_floor = (q_raw // step) * step
+            else:
+                q_floor = q_raw
+
+            if q_floor < mn:
+                return {
+                    "status": "skipped",
+                    "mode": mode_label,
+                    "endpoint": url,
+                    "reason": f"Quantity below minQty after step flooring (raw={quantity})",
+                    "filters": filters,
+                }
+
+            # Start with step-decimals, then try fewer decimals (coarser) to bypass -1111
+            step_decimals = max(0, -step.normalize().as_tuple().exponent) if step > 0 else 8
+
+            candidates: List[str] = []
+            seen = set()
+
+            for d in range(step_decimals, -1, -1):
+                quant = Decimal("1").scaleb(-d)  # 10^-d
+                # Coarsen by flooring to 10^-d (only affects testnet infra layer)
+                q_try = (q_floor // quant) * quant
+
+                if q_try < mn:
+                    continue
+
+                s = format(q_try.quantize(quant, rounding=ROUND_DOWN), "f").rstrip("0").rstrip(".") or "0"
+                if s == "0":
+                    continue
+                if s in seen:
+                    continue
+                seen.add(s)
+                candidates.append(s)
+
+            if not candidates:
+                return {
+                    "status": "skipped",
+                    "mode": mode_label,
+                    "endpoint": url,
+                    "reason": f"No valid qty candidates after normalization (raw={quantity})",
+                    "filters": filters,
+                }
+
         except Exception as exc:
             return {
                 "status": "error",
@@ -736,80 +882,115 @@ class BinanceDemoExchangeClient(ExchangeClient):
                 "error": f"Failed to fetch/normalize symbol filters: {exc}",
             }
 
-        ts = int(_time.time() * 1000)
-        params = {
-            "symbol": symbol,
-            "side": side.value,
-            "type": "MARKET" if order_type == OrderType.MARKET else str(order_type),
-            "quantity": qty_str,
-            "timestamp": str(ts),
-            "recvWindow": str(self._params.recv_window_ms),
+        def _do_request(qty_str: str) -> Dict[str, Any]:
+            ts = int(_time.time() * 1000)
+            params = {
+                "symbol": symbol,
+                "side": side.value,
+                "type": "MARKET",
+                "quantity": qty_str,
+                "timestamp": str(ts),
+                "recvWindow": str(self._params.recv_window_ms),
+            }
+
+            query_string = _parse.urlencode(params)
+            signature = _hmac.new(
+                api_secret.encode("utf-8"),
+                query_string.encode("utf-8"),
+                _hashlib.sha256,
+            ).hexdigest()
+
+            body = (query_string + "&signature=" + signature).encode("utf-8")
+
+            headers = {
+                "X-MBX-APIKEY": api_key,
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+
+            req = _request.Request(url, data=body, headers=headers, method="POST")
+
+            try:
+                with _request.urlopen(req, timeout=self._params.http_timeout_sec) as resp:
+                    status = resp.getcode()
+                    raw_body = resp.read().decode("utf-8")
+                try:
+                    parsed_body: Any = _json.loads(raw_body)
+                except Exception:
+                    parsed_body = raw_body
+
+                return {
+                    "status": status,
+                    "mode": mode_label,
+                    "endpoint": url,
+                    "request_params": params,
+                    "response": parsed_body,
+                }
+
+            except _error.HTTPError as exc:
+                raw_body = ""
+                try:
+                    raw_body = exc.read().decode("utf-8")
+                except Exception:
+                    pass
+
+                try:
+                    parsed_body: Any = _json.loads(raw_body) if raw_body else raw_body
+                except Exception:
+                    parsed_body = raw_body
+
+                return {
+                    "status": "error",
+                    "mode": mode_label,
+                    "endpoint": url,
+                    "http_status": exc.code,
+                    "request_params": params,
+                    "response": parsed_body,
+                    "error": f"HTTPError {exc.code}",
+                }
+
+         # --- Try candidates until success ---
+        last_err: Optional[Dict[str, Any]] = None
+
+        for qty_str in candidates:
+            logger.info(
+                "[binance-testnet] mode=%s symbol=%s raw_qty=%.18f step=%s min=%s try_qty=%s",
+                mode_label, symbol, float(quantity),
+                filters.get("stepSize"), filters.get("minQty"),
+                qty_str,
+            )
+
+            res = _do_request(qty_str)
+
+            if res.get("status") != "error":
+                return res
+
+            last_err = res
+
+            code = None
+            msg = ""
+            resp_body = res.get("response")
+            if isinstance(resp_body, dict):
+                code = resp_body.get("code")
+                msg = str(resp_body.get("msg", "") or "")
+
+            # Retry also on LOT_SIZE failures (common when first candidate isn't step-aligned)
+            if code == -1111:
+                continue
+            if code == -1013 and "LOT_SIZE" in msg:
+                continue
+
+            # other errors: stop immediately
+            return res
+
+        return {
+            "status": "skipped",
+            "mode": mode_label,
+            "endpoint": url,
+            "reason": "All qty candidates rejected (including LOT_SIZE/-1111)",
+            "filters": filters,
+            "last_error": last_err,
+            "candidates": candidates,
         }
-
-        query_string = _parse.urlencode(params)
-        signature = _hmac.new(
-            api_secret.encode("utf-8"),
-            query_string.encode("utf-8"),
-            _hashlib.sha256,
-        ).hexdigest()
-
-        body = (query_string + "&signature=" + signature).encode("utf-8")
-
-        headers = {
-            "X-MBX-APIKEY": api_key,
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-
-        req = _request.Request(url, data=body, headers=headers, method="POST")
-
-        try:
-            with _request.urlopen(req, timeout=self._params.http_timeout_sec) as resp:
-                status = resp.getcode()
-                raw_body = resp.read().decode("utf-8")
-
-            try:
-                parsed_body: Any = _json.loads(raw_body)
-            except Exception:
-                parsed_body = raw_body
-
-            return {
-                "status": status,
-                "mode": mode_label,
-                "endpoint": url,
-                "request_params": params,
-                "response": parsed_body,
-            }
-
-        except _error.HTTPError as exc:
-            raw_body = ""
-            try:
-                raw_body = exc.read().decode("utf-8")
-            except Exception:
-                pass
-
-            try:
-                parsed_body: Any = _json.loads(raw_body) if raw_body else raw_body
-            except Exception:
-                parsed_body = raw_body
-
-            return {
-                "status": "error",
-                "mode": mode_label,
-                "endpoint": url,
-                "http_status": exc.code,
-                "request_params": params,
-                "response": parsed_body,
-                "error": f"HTTPError {exc.code}",
-            }
-
-        except Exception as exc:
-            return {
-                "status": "error",
-                "mode": mode_label,
-                "endpoint": url,
-                "error": str(exc),
-                "request_params": params,
-            }
 
 
 
@@ -835,15 +1016,16 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         if params.web3 is None:
             raise ValueError("PancakeDemoParams.web3 is required in demo mode")
         self._web3 = params.web3
+        _apply_poa_middleware(self._web3)
         self._params = params
-
+    
     async def create_order(
         self,
         symbol: str,
         side: OrderSide,
         quantity: float,
         price: Optional[float] = None,
-        quote_asset: str = "USDT",
+        quote_asset: Optional[str] = None,
         fee_rate: Optional[float] = None,
         price_hint: Optional[float] = None,
         **_: object,
@@ -908,7 +1090,7 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             if isinstance(avg_fill, (int, float)) and avg_fill > 0:
                 execution_price = float(avg_fill)
 
-        base_asset = symbol.replace(quote_asset, "")
+        base_asset, quote_asset = resolve_base_quote(symbol)
 
         # 4) Apply balance changes using execution_price
         if side == OrderSide.BUY:
@@ -1010,26 +1192,18 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         Run the same swap on multiple forked blocks and collect per-block metadata.
 
         For each forked block this method:
-          - Resets the fork to base_block + offset
-          - Impersonates or signs locally depending on params.private_key
-          - Builds and sends one swap transaction
-          - Measures token balances before and after the swap
-          - Records per-block fill price and return vs hint
+        - Resets the fork to base_block + offset (with anvil/hardhat fallback)
+        - Impersonates or signs locally depending on params.private_key
+        - Builds and sends one swap transaction
+        - Measures token balances before and after the swap
+        - Records per-block fill price and return vs hint
         """
         web3 = self._web3
-
-        try:
-            web3.middleware_onion.clear()
-        except Exception:
-            pass
-
         offsets = tuple(self._params.block_offsets or (1, 2, 3))
 
+        # Upstream (real chain) web3 for reading latest block height.
         upstream_web3 = Web3(Web3.HTTPProvider(self._params.upstream_rpc_url))
-        try:
-            upstream_web3.middleware_onion.clear()
-        except Exception:
-            pass
+        _apply_poa_middleware(upstream_web3)
 
         base_block = int(upstream_web3.eth.block_number)
 
@@ -1047,25 +1221,20 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         else:
             trader = Web3.to_checksum_address(self._params.account_address)
 
-        # Detect fork engine and select reset/impersonate methods.
-        fork_engine = getattr(self._params, "fork_engine", "auto")
-        if fork_engine == "auto":
-            fork_engine = self._detect_fork_engine(provider)
-            if fork_engine == "unknown":
-                ep = getattr(provider, "endpoint_uri", None)
-                raise RuntimeError(
-                    f"Fork RPC does not support anvil/hardhat reset. endpoint={ep}. "
-                    "Make sure params.web3 points to local anvil/hardhat."
-                )
+        # Treat fork_engine as preference only; always fallback if the preferred engine fails.
+        fork_engine_pref = getattr(self._params, "fork_engine", "auto") or "auto"
+        if fork_engine_pref == "auto":
+            detected = self._detect_fork_engine(provider)
+            # Not fatal: even if unknown, fallback reset will still try both.
+            if detected in ("anvil", "hardhat"):
+                fork_engine_pref = detected
 
-        if fork_engine == "hardhat":
-            reset_method = "hardhat_reset"
-            impersonate_method = "hardhat_impersonateAccount"
-        elif fork_engine == "anvil":
-            reset_method = "anvil_reset"
-            impersonate_method = "anvil_impersonateAccount"
-        else:
-            raise ValueError(f"Unknown fork engine: {fork_engine}")
+        def _get_nonce_safe(addr: str) -> int:
+            """Get a usable nonce; prefer pending if supported."""
+            try:
+                return int(web3.eth.get_transaction_count(addr, "pending"))
+            except Exception:
+                return int(web3.eth.get_transaction_count(addr))
 
         per_block_results: List[Dict[str, Any]] = []
 
@@ -1080,29 +1249,73 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                 }
             }
 
-            resp = provider.make_request(reset_method, [reset_config])
-            if isinstance(resp, dict) and "error" in resp:
-                raise RuntimeError(f"{reset_method} failed: {resp['error']}")
+            # --- Reset fork with fallback (anvil_reset <-> hardhat_reset) ---
+            used_reset_method = ""
+            try:
+                used_reset_method = self._fork_reset_any(provider, reset_config, prefer=fork_engine_pref)
+            except Exception as exc:
+                raise RuntimeError(f"fork reset failed at block={fork_block}: {exc}") from exc
 
+            # --- Impersonate with fallback (only if not local signing) ---
+            used_impersonate_method = ""
             if not use_local_signing:
-                provider.make_request(impersonate_method, [trader])
+                try:
+                    used_impersonate_method = self._impersonate_any(provider, trader, prefer=fork_engine_pref)
+                except Exception as exc:
+                    raise RuntimeError(f"impersonate failed for trader={trader}: {exc}") from exc
 
-            builder_qty = float(quantity)
-            if side == OrderSide.BUY:
-                builder_qty = float(quantity) * float(price)
+            # Build swap tx.
+            # IMPORTANT: The builder must handle any funding/Permit2 allowance itself.
+            try:
+                # Some builders accept price, some do not. Try with price first.
+                tx_dict = self._params.build_swap_tx(
+                    web3=web3,
+                    symbol=symbol,
+                    quantity=float(quantity),
+                    side=side.value,
+                    price=float(price),
+                )
+            except TypeError:
+                tx_dict = self._params.build_swap_tx(
+                    web3=web3,
+                    symbol=symbol,
+                    quantity=float(quantity),
+                    side=side.value,
+                )
 
-            tx_dict = self._params.build_swap_tx(
-                web3=web3,
-                symbol=symbol,
-                quantity=builder_qty,
-                side=side.value,
-            )
+            # Read demo metadata BEFORE stripping _demo_* keys
+            token_in = tx_dict.get("_demo_token_in", None)
+            token_out = tx_dict.get("_demo_token_out", None)
+            amount_in_wei = tx_dict.get("_demo_amount_in_wei", None)
 
-            token_in = tx_dict.pop("_demo_token_in", None)
-            token_out = tx_dict.pop("_demo_token_out", None)
+            # Remove demo helper keys before sending.
+            for k in list(tx_dict.keys()):
+                if k.startswith("_demo_"):
+                    tx_dict.pop(k, None)
 
-            self._ensure_allowance(web3, trader, token_in, router, amount_in_wei, priv_key, use_local_signing)
-            
+            # Enforce sender + chainId for signing safety.
+            tx_dict["from"] = trader
+            tx_dict.setdefault("chainId", int(web3.eth.chain_id))
+
+            # Provide reasonable defaults when builder didn't set them.
+            if "gas" not in tx_dict:
+                try:
+                    est = int(web3.eth.estimate_gas(tx_dict))
+                    tx_dict["gas"] = int(est * 12 // 10)  # +20% buffer
+                except Exception:
+                    tx_dict["gas"] = 600_000
+
+            if "gasPrice" not in tx_dict and "maxFeePerGas" not in tx_dict:
+                try:
+                    tx_dict["gasPrice"] = int(web3.eth.gas_price)
+                except Exception:
+                    pass
+
+            if use_local_signing:
+                # Raw tx requires explicit nonce; do not override if builder set it.
+                tx_dict.setdefault("nonce", _get_nonce_safe(trader))
+
+            # Prepare ERC20 contracts for balance delta measurement.
             token_in_contract = None
             token_out_contract = None
 
@@ -1120,8 +1333,6 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                     token_in_contract = None
                     token_out_contract = None
 
-            tx_dict["from"] = trader
-
             bal_in_before = None
             bal_out_before = None
             decimals_in = None
@@ -1131,13 +1342,45 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                 try:
                     bal_in_before = token_in_contract.functions.balanceOf(trader).call()
                     bal_out_before = token_out_contract.functions.balanceOf(trader).call()
-                    decimals_in = token_in_contract.functions.decimals().call()
-                    decimals_out = token_out_contract.functions.decimals().call()
+                    decimals_in = int(token_in_contract.functions.decimals().call())
+                    decimals_out = int(token_out_contract.functions.decimals().call())
                 except Exception:
                     bal_in_before = None
                     bal_out_before = None
                     decimals_in = None
                     decimals_out = None
+
+            # --- FAIL FAST: avoid TRANSFER_FROM_FAILED by checking token_in balance first ---
+            # This requires builder to provide `_demo_amount_in_wei`.
+            if (
+                token_in_contract is not None
+                and bal_in_before is not None
+                and amount_in_wei is not None
+            ):
+                try:
+                    need = int(amount_in_wei)
+                    have = int(bal_in_before)
+                    if have < need:
+                        per_block_results.append(
+                            {
+                                "fork_block": fork_block,
+                                "tx_hash": "",
+                                "status": 0,
+                                "gas_used": 0,
+                                "token_in": token_in,
+                                "token_out": token_out,
+                                "revert_reason": (
+                                    "insufficient token_in balance before swap: "
+                                    f"have={have} need={need}"
+                                ),
+                                "reset_method": used_reset_method,
+                                "impersonate_method": used_impersonate_method,
+                            }
+                        )
+                        continue
+                except Exception:
+                    # Best-effort; if parsing fails, continue to normal send path.
+                    pass
 
             tx_hash_hex = ""
             status = 0
@@ -1164,15 +1407,16 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                     gas_used = int(getattr(receipt, "gasUsed", 0))
 
                 if status == 0:
+                    # Best-effort revert reason extraction.
                     try:
                         web3.eth.call(
                             {
-                                "to": tx_dict["to"],
-                                "from": tx_dict["from"],
-                                "data": tx_dict["data"],
+                                "to": tx_dict.get("to"),
+                                "from": tx_dict.get("from"),
+                                "data": tx_dict.get("data"),
                                 "value": tx_dict.get("value", 0),
                             },
-                            block_identifier=fork_block,
+                            block_identifier="latest",
                         )
                     except Exception as exc:
                         revert_reason = str(exc)
@@ -1191,6 +1435,8 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                 and token_out_contract is not None
                 and bal_in_before is not None
                 and bal_out_before is not None
+                and decimals_in is not None
+                and decimals_out is not None
             ):
                 try:
                     bal_in_after = token_in_contract.functions.balanceOf(trader).call()
@@ -1199,32 +1445,23 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                     delta_in = int(bal_in_after) - int(bal_in_before)
                     delta_out = int(bal_out_after) - int(bal_out_before)
 
-                    if decimals_in is None:
-                        decimals_in = token_in_contract.functions.decimals().call()
-                    if decimals_out is None:
-                        decimals_out = token_out_contract.functions.decimals().call()
+                    scale_in = 10 ** int(decimals_in)
+                    scale_out = 10 ** int(decimals_out)
 
-                    if (
-                        decimals_in is not None
-                        and decimals_out is not None
-                        and delta_in is not None
-                        and delta_out is not None
-                        and delta_in != 0
-                    ):
-                        scale_in = 10 ** int(decimals_in)
-                        scale_out = 10 ** int(decimals_out)
+                    # Assume builder mapping:
+                    # - BUY  : token_in = quote (spent), token_out = base (received)
+                    # - SELL : token_in = base  (spent), token_out = quote(received)
+                    if side == OrderSide.BUY:
+                        quote_qty = (-delta_in) / scale_in
+                        base_qty = (delta_out) / scale_out
+                    else:
+                        base_qty = (-delta_in) / scale_in
+                        quote_qty = (delta_out) / scale_out
 
-                        if side == OrderSide.BUY:
-                            base_qty = -delta_in / scale_in
-                            quote_qty = delta_out / scale_out
-                        else:
-                            quote_qty = -delta_in / scale_in
-                            base_qty = delta_out / scale_out
-
-                        if base_qty != 0:
-                            fill_price = quote_qty / base_qty
-                            if price > 0:
-                                return_vs_hint = fill_price / price - 1.0
+                    if base_qty and base_qty > 0:
+                        fill_price = quote_qty / base_qty
+                        if price > 0:
+                            return_vs_hint = fill_price / price - 1.0
 
                 except Exception:
                     delta_in = None
@@ -1237,6 +1474,8 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                 "tx_hash": tx_hash_hex,
                 "status": status,
                 "gas_used": gas_used,
+                "reset_method": used_reset_method,
+                "impersonate_method": used_impersonate_method,
             }
 
             if revert_reason is not None:
@@ -1283,6 +1522,7 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         return demo_meta
 
 
+
     def _wait_for_upstream_block(
         self,
         upstream_web3: Web3,
@@ -1315,6 +1555,75 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         except Exception:
             return False
 
+    def _fork_reset_any(
+        self,
+        provider: Any,
+        reset_config: Dict[str, Any],
+        prefer: str = "auto",
+    ) -> str:
+        """
+        Try fork reset using Anvil/Hardhat methods with fallback.
+
+        Returns:
+            The RPC method name used for reset.
+        """
+        methods: List[str]
+        if prefer == "hardhat":
+            methods = ["hardhat_reset", "anvil_reset"]
+        elif prefer == "anvil":
+            methods = ["anvil_reset", "hardhat_reset"]
+        else:
+            methods = ["anvil_reset", "hardhat_reset"]
+
+        last_err: Optional[Any] = None
+        for m in methods:
+            try:
+                resp = provider.make_request(m, [reset_config])
+                if isinstance(resp, dict) and resp.get("error"):
+                    last_err = resp["error"]
+                    continue
+                return m
+            except Exception as exc:
+                last_err = exc
+                continue
+
+        raise RuntimeError(f"fork reset failed (tried {methods}). last_error={last_err}")
+
+    def _impersonate_any(
+        self,
+        provider: Any,
+        addr: str,
+        prefer: str = "auto",
+    ) -> str:
+        """
+        Try account impersonation using Anvil/Hardhat methods with fallback.
+
+        Returns:
+            The RPC method name used for impersonation.
+        """
+        methods: List[str]
+        if prefer == "hardhat":
+            methods = ["hardhat_impersonateAccount", "anvil_impersonateAccount"]
+        elif prefer == "anvil":
+            methods = ["anvil_impersonateAccount", "hardhat_impersonateAccount"]
+        else:
+            methods = ["anvil_impersonateAccount", "hardhat_impersonateAccount"]
+
+        last_err: Optional[Any] = None
+        for m in methods:
+            try:
+                resp = provider.make_request(m, [addr])
+                if isinstance(resp, dict) and resp.get("error"):
+                    last_err = resp["error"]
+                    continue
+                return m
+            except Exception as exc:
+                last_err = exc
+                continue
+
+        raise RuntimeError(f"impersonate failed (tried {methods}). last_error={last_err}")
+
+
     def _detect_fork_engine(self, provider: Any) -> str:
         if self._rpc_supports(provider, "anvil_nodeInfo") or self._rpc_supports(provider, "anvil_reset"):
             return "anvil"
@@ -1326,29 +1635,77 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         self,
         web3: Web3,
         owner: str,
-        token: str,
-        spender: str,
+        token: Optional[str],
+        spender: Optional[str],
         amount_wei: int,
         priv_key: Optional[str],
         use_local_signing: bool,
-    ) -> None:
-        erc20 = web3.eth.contract(address=Web3.to_checksum_address(token), abi=ERC20_ABI)
-        cur = int(erc20.functions.allowance(owner, spender).call())
+    ) -> bool:
+        """
+        Ensure ERC20 allowance(owner -> spender) is at least amount_wei.
+
+        Returns:
+            True  if an approve transaction was sent (allowance updated),
+            False if allowance was already enough or inputs were invalid.
+        """
+        if not token or not spender:
+            return False
+        if amount_wei <= 0:
+            return False
+
+        token = Web3.to_checksum_address(token)
+        spender = Web3.to_checksum_address(spender)
+        owner = Web3.to_checksum_address(owner)
+
+        erc20 = web3.eth.contract(address=token, abi=ERC20_ABI)
+
+        # Read current allowance
+        try:
+            cur = int(erc20.functions.allowance(owner, spender).call())
+        except Exception:
+            return False
+
+        # If enough, nothing to do
         if cur >= amount_wei:
-            return
+            return False
 
-        tx = erc20.functions.approve(spender, amount_wei).build_transaction({
-            "from": owner,
-            "nonce": web3.eth.get_transaction_count(owner),
-        })
+        def _send_tx(tx: Dict[str, Any]) -> None:
+            """
+            Send a transaction either by local signing (eth_sendRawTransaction)
+            or by node-managed signing (eth_sendTransaction / impersonation).
+            """
+            tx.setdefault("from", owner)
+            tx.setdefault("chainId", int(web3.eth.chain_id))
+            tx.setdefault("gas", 150_000)
 
-        tx.setdefault("gas", 120000)
+            # BSC forks often use legacy gasPrice
+            if "gasPrice" not in tx and "maxFeePerGas" not in tx:
+                try:
+                    tx["gasPrice"] = int(web3.eth.gas_price)
+                except Exception:
+                    pass
 
-        if use_local_signing:
-            signed = Account.sign_transaction(tx, priv_key)  # type: ignore[arg-type]
-            raw = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
-            h = web3.eth.send_raw_transaction(raw)
-        else:
-            h = web3.eth.send_transaction(tx)
+            if use_local_signing:
+                # Raw transactions require an explicit nonce
+                tx.setdefault("nonce", web3.eth.get_transaction_count(owner))
+                signed = Account.sign_transaction(tx, priv_key)  # type: ignore[arg-type]
+                raw = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
+                tx_hash = web3.eth.send_raw_transaction(raw)
+            else:
+                tx_hash = web3.eth.send_transaction(tx)
 
-        web3.eth.wait_for_transaction_receipt(h)
+            web3.eth.wait_for_transaction_receipt(tx_hash)
+
+        # Some tokens require setting allowance to 0 before changing it
+        try:
+            if cur != 0:
+                tx0 = erc20.functions.approve(spender, 0).build_transaction({"from": owner})
+                _send_tx(tx0)
+        except Exception:
+            # If 0-approve fails, still try direct approve below
+            pass
+
+        # Approve the required amount
+        tx1 = erc20.functions.approve(spender, amount_wei).build_transaction({"from": owner})
+        _send_tx(tx1)
+        return True

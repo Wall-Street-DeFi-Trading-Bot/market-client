@@ -48,3 +48,4 @@ class BotConfig:
     max_position_notional_usd: Optional[float] = None
 
     enable_csv: bool = False
+    #enable_csv: bool = True

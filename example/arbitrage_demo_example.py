@@ -1,5 +1,3 @@
-# scripts/run_arbitrage_bot_demo.py
-
 import asyncio
 import os
 import signal
@@ -20,14 +18,24 @@ from market_data_client.arbitrage.bot import run_arbitrage_bot
 from market_data_client.arbitrage.config import BotConfig, ExecutionMode
 from market_data_client.arbitrage.exchange import BinanceDemoParams, PancakeDemoParams
 from market_data_client.arbitrage.dex.web3_compat import disable_poa_extra_data_validation
-from market_data_client.arbitrage.dex.routers.universal_router_v2 import build_swap_tx_router
+
+from market_data_client.arbitrage.dex.routers.universal_router_v2 import (
+    build_swap_tx_router_v3,
+    build_swap_tx_router_v2,
+)
+
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+logging.getLogger("market_data_client.arbitrage.exchange").setLevel(logging.INFO)
 
 
 def _set_first_existing(obj: object, names: list[str], value: object) -> None:
-    """
-    Set the first attribute that exists on obj among the provided names.
-    This keeps the code compatible with different BinanceDemoParams versions.
-    """
     for n in names:
         if hasattr(obj, n):
             setattr(obj, n, value)
@@ -36,18 +44,6 @@ def _set_first_existing(obj: object, names: list[str], value: object) -> None:
 
 
 def _build_binance_params(prefix: str, kind: str, default_base_url: str) -> BinanceDemoParams:
-    """
-    Build BinanceDemoParams from env vars without relying on __init__ kwargs.
-
-    kind must be one of:
-      - "spot"
-      - "futures"
-
-    Expected env vars:
-      - {prefix}_API_KEY
-      - {prefix}_API_SECRET
-      - {prefix}_BASE_URL (optional)
-    """
     p = BinanceDemoParams()
 
     api_key = os.getenv(f"{prefix}_API_KEY", "")
@@ -78,7 +74,6 @@ def _build_binance_params(prefix: str, kind: str, default_base_url: str) -> Bina
     return p
 
 
-
 async def main() -> None:
     symbols = ["BNBUSDT"]
 
@@ -86,12 +81,14 @@ async def main() -> None:
         ("Binance", "spot"),
         ("Binance", "perpetual"),
         ("PancakeSwapV3", "swap"),
+        ("PancakeSwapV2", "swap"),
     ]
 
     paper_initial_balances = {
         ("Binance", "spot"): {"USDT": 10_000.0, "BNB": 100.0},
         ("Binance", "perpetual"): {"USDT": 10_000.0, "BNB": 100.0},
-        ("PancakeSwapV3", "swap"): {"USDT": 10_000.0, "BNB": 100.0},
+        ("PancakeSwapV3", "swap"): {"USDT": 10_000.0, "WBNB": 100.0, "BNB": 2.0},
+        ("PancakeSwapV2", "swap"): {"USDT": 10_000.0, "WBNB": 100.0, "BNB": 2.0},
     }
 
     config = BotConfig(
@@ -108,10 +105,10 @@ async def main() -> None:
     symbol_mapping = {
         "BNBUSDT": {
             "PancakeSwapV3": os.getenv("BOT_PANCAKE_PAIR", "USDTWBNB"),
+            "PancakeSwapV2": os.getenv("BOT_PANCAKE_PAIR", "USDTWBNB"),
         }
     }
 
-    
     demo_binance_spot = _build_binance_params(
         prefix="DEMO_BINANCE_SPOT",
         kind="spot",
@@ -131,7 +128,6 @@ async def main() -> None:
         except Exception:
             pass
 
-    
     demo_binance_params: Dict[Tuple[str, str], BinanceDemoParams] = {
         ("Binance", "spot"): demo_binance_spot,
         ("Binance", "perpetual"): demo_binance_futures,
@@ -145,20 +141,34 @@ async def main() -> None:
     disable_poa_extra_data_validation()
     web3 = Web3(HTTPProvider(fork_rpc_url))
 
-    demo_pancake = PancakeDemoParams(
+    # V3 uses V3 builder
+    demo_pancake_v3 = PancakeDemoParams(
         web3=web3,
         account_address="",
-        build_swap_tx=build_swap_tx_router,
+        build_swap_tx=build_swap_tx_router_v3,
         private_key=private_key,
         block_offsets=(1, 2, 3),
         default_fee_rate=float(os.getenv("DEMO_PANCAKE_DEFAULT_FEE_RATE", "0.0005")),
     )
 
-    demo_pancake.upstream_rpc_url = upstream_rpc_url  # type: ignore[attr-defined]
-    demo_pancake.fork_engine = fork_engine  # type: ignore[attr-defined]
+    # V2 uses V2 builder
+    demo_pancake_v2 = PancakeDemoParams(
+        web3=web3,
+        account_address="",
+        build_swap_tx=build_swap_tx_router_v2,
+        private_key=private_key,
+        block_offsets=(1, 2, 3),
+        default_fee_rate=float(os.getenv("DEMO_PANCAKE_DEFAULT_FEE_RATE", "0.0005")),
+    )
+
+    demo_pancake_v3.upstream_rpc_url = upstream_rpc_url  # type: ignore[attr-defined]
+    demo_pancake_v3.fork_engine = fork_engine  # type: ignore[attr-defined]
+    demo_pancake_v2.upstream_rpc_url = upstream_rpc_url  # type: ignore[attr-defined]
+    demo_pancake_v2.fork_engine = fork_engine  # type: ignore[attr-defined]
 
     demo_pancake_params: Dict[Tuple[str, str], PancakeDemoParams] = {
-        ("PancakeSwapV3", "swap"): demo_pancake,
+        ("PancakeSwapV3", "swap"): demo_pancake_v3,
+        ("PancakeSwapV2", "swap"): demo_pancake_v2,
     }
 
     stop_event = asyncio.Event()

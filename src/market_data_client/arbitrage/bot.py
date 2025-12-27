@@ -25,17 +25,6 @@ from .risk import RiskManager
 from .state import BotState
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    )
-    logger.addHandler(handler)
 
 
 def _log_demo_trade(trade: Any) -> None:
@@ -213,6 +202,24 @@ def _build_exchange_clients(
 
     return clients
 
+def _snapshot_balances(state: BotState) -> Dict[Tuple[str, str], Dict[str, float]]:
+    snap: Dict[Tuple[str, str], Dict[str, float]] = {}
+    for key, account in state.accounts.items():
+        snap[key] = {str(a).upper(): float(v or 0.0) for a, v in (account.balances or {}).items()}
+    return snap
+
+def _total_equity_usdt_from_snapshot(
+    snapshot: Dict[Tuple[str, str], Dict[str, float]],
+    price_usdt: Dict[str, float],
+) -> float:
+    total = 0.0
+    for _key, bals in snapshot.items():
+        for asset, amt in (bals or {}).items():
+            px = price_usdt.get(asset)
+            if px is None:
+                continue
+            total += float(amt or 0.0) * float(px)
+    return total
 
 def _total_usdt_equity(state: BotState) -> float:
     total = 0.0
@@ -233,6 +240,27 @@ def _format_table(headers: List[str], rows: List[List[str]]) -> str:
     out = [fmt_row(headers), sep]
     out.extend(fmt_row(r) for r in rows)
     return "\n".join(out)
+
+def _asset_universe_from_config(config: BotConfig) -> set[str]:
+    assets: set[str] = set()
+    for (_ex, _inst), bals in (config.paper_initial_balances or {}).items():
+        assets |= {a.upper() for a in bals.keys()}
+    assets |= {"USDT", "USDC", "WBNB", "BNB", "BTC", "BTCB", "ETH", "WETH", "CAKE", "TWT", "SFP"}
+    return assets
+
+
+def _build_symbol_splitter(quotes: set[str]):
+    # longest suffix wins (BTCB before BTC)
+    quote_list = sorted({q.upper() for q in quotes}, key=len, reverse=True)
+
+    def split(symbol: str) -> tuple[str, str]:
+        s = "".join(ch for ch in symbol.upper() if ch.isalnum())  # "ETH/USDT" 같은 것도 방어
+        for q in quote_list:
+            if s.endswith(q) and len(s) > len(q):
+                return s[:-len(q)], q
+        raise ValueError(f"Cannot split symbol={symbol}. quotes={quote_list}")
+
+    return split
 
 
 def _balances_table(state: BotState, config: BotConfig) -> str:
@@ -261,6 +289,30 @@ def _balances_table(state: BotState, config: BotConfig) -> str:
     return _format_table(headers, rows)
 
 
+def _total_equity_usdt(state: BotState, price_usdt: Dict[str, float]) -> float:
+    total = 0.0
+    missing: set[str] = set()
+
+    for account in state.accounts.values():
+        for asset, amt in (account.balances or {}).items():
+            a = str(asset).upper()
+            q = float(amt or 0.0)
+            if q == 0.0:
+                continue
+
+            px = price_usdt.get(a)
+            if px is None:
+                missing.add(a)
+                continue
+
+            total += q * px
+
+    if missing:
+        logger.info("equity_usdt warning: missing prices for assets=%s", ",".join(sorted(missing)))
+
+    return total
+
+
 async def run_arbitrage_bot(
     config: BotConfig,
     symbol_mapping: Optional[Dict[str, Dict[str, str]]] = None,
@@ -283,12 +335,21 @@ async def run_arbitrage_bot(
     )
 
     state = BotState()
+    split_symbol = _build_symbol_splitter(_asset_universe_from_config(config))
+    if demo_pancake_params is not None:
+        for (ex, inst), p in list(demo_pancake_params.items()):
+            if ex in ("PancakeSwapV2", "PancakeSwapV3") and inst == "swap":
+                setattr(p, "symbol_splitter", split_symbol)
+
     exchange_clients = _build_exchange_clients(
         config=config,
         state=state,
         demo_binance=demo_binance_params,
         demo_pancake=demo_pancake_params,
     )
+
+    initial_snapshot = _snapshot_balances(state)
+    last_price_usdt: Dict[str, float] = {"USDT": 1.0, "USDC": 1.0}
 
     initial_equity_usdt = 0.0
     total_realized_pnl_usdt = 0.0
@@ -312,6 +373,8 @@ async def run_arbitrage_bot(
             logger.info("scan=%s time=%s", scan_count, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
             opportunities: List[ArbitrageOpportunity] = await detector.scan_opportunities()
+            if opportunities:
+                last_price_usdt = _derive_price_usdt_from_opps(opportunities, split_symbol)
 
             if not opportunities:
                 await asyncio.sleep(config.scan_interval)
@@ -361,17 +424,23 @@ async def run_arbitrage_bot(
         logger.info("MarketDataClient stopped")
 
         if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
-            final_equity_usdt = _total_usdt_equity(state)
-            roi_pct = 0.0
-            if initial_equity_usdt > 0:
-                roi_pct = (final_equity_usdt - initial_equity_usdt) / initial_equity_usdt * 100.0
+            initial_equity_usdt = _total_equity_usdt_from_snapshot(initial_snapshot, last_price_usdt)
+            final_equity_usdt = _total_equity_usdt(state, last_price_usdt)  # ✅ 여기서만 호출
 
-            logger.info("final_summary mode=%s trades=%s", config.mode.value, total_trades_executed)
-            logger.info("equity_usdt initial=%s final=%s pnl=%s roi_pct=%s",
-                        f"{initial_equity_usdt:.6f}",
-                        f"{final_equity_usdt:.6f}",
-                        f"{(final_equity_usdt - initial_equity_usdt):.6f}",
-                        f"{roi_pct:.6f}")
+            pnl_total = final_equity_usdt - initial_equity_usdt
+            roi_pct = (pnl_total / initial_equity_usdt * 100.0) if initial_equity_usdt > 0 else 0.0
+
+            logger.info("final_summary mode=%s", config.mode.value)
+            logger.info(
+                "equity_usdt(mtm) initial=%s final=%s pnl=%s roi_pct=%s",
+                f"{initial_equity_usdt:.6f}",
+                f"{final_equity_usdt:.6f}",
+                f"{pnl_total:.6f}",
+                f"{roi_pct:.6f}",
+            )
 
             table = _balances_table(state, config)
             logger.info("balances:\n%s", table)
+
+
+
