@@ -1,30 +1,99 @@
-# src/market_data_client/arbitrage/bot.py
-
 from __future__ import annotations
 
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..market_data_client import CexConfig, DexConfig, MarketDataClient
 from .arbitrage_detector import ArbitrageDetector, ArbitrageOpportunity
 from .config import BotConfig, ExecutionMode
 from .exchange import (
-    BinanceExchangeClient,
     BinanceDemoExchangeClient,
     BinanceDemoParams,
+    BinanceExchangeClient,
     ExchangeClient,
-    PaperExchangeClient,
-    PancakeSwapExchangeClient,
-    PancakeSwapDemoExchangeClient,
     PancakeDemoParams,
+    PancakeSwapDemoExchangeClient,
+    PancakeSwapExchangeClient,
+    PaperExchangeClient,
 )
 from .executor import TradeExecutor
 from .risk import RiskManager
 from .state import BotState
 
 logger = logging.getLogger(__name__)
+
+_LOGGING_CONFIGURED = False
+
+
+def _dedupe_logger_handlers(l: logging.Logger) -> None:
+    """
+    Remove duplicated handlers (common cause of double logs).
+    Dedupe key: (handler type, stream id if StreamHandler else handler id)
+    """
+    seen: set[tuple] = set()
+    new_handlers: list[logging.Handler] = []
+    for h in list(l.handlers):
+        stream = getattr(h, "stream", None)
+        key = (type(h), id(stream) if stream is not None else id(h))
+        if key in seen:
+            continue
+        seen.add(key)
+        new_handlers.append(h)
+    l.handlers = new_handlers
+
+
+def configure_market_data_client_logging(level: int = logging.INFO) -> None:
+    """
+    Configure logging so that:
+      - only 'market_data_client' package logger owns a StreamHandler
+      - all child loggers propagate to it (no per-module handlers)
+      - duplicated handlers on root/package are removed
+    This removes the most common "every line printed twice" problem.
+    """
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+
+    # Dedupe root handlers (people often attach multiple StreamHandlers)
+    root = logging.getLogger()
+    _dedupe_logger_handlers(root)
+
+    pkg = logging.getLogger("market_data_client")
+    _dedupe_logger_handlers(pkg)
+
+    if not pkg.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        pkg.addHandler(h)
+
+    pkg.setLevel(level)
+    pkg.propagate = False
+
+    # Clear handlers of existing child loggers and make them bubble to package logger
+    for name, obj in logging.root.manager.loggerDict.items():
+        if not isinstance(obj, logging.Logger):
+            continue
+        if name.startswith("market_data_client") and name != "market_data_client":
+            obj.handlers = []
+            obj.propagate = True
+            obj.setLevel(level)
+
+    _LOGGING_CONFIGURED = True
+
+
+# Configure on import (idempotent). If you configure elsewhere, it still won't double-configure.
+configure_market_data_client_logging()
+
+
+def _norm_asset_key(a: Any) -> str:
+    return str(a).upper()
 
 
 def _log_demo_trade(trade: Any) -> None:
@@ -62,11 +131,7 @@ def _log_demo_trade(trade: Any) -> None:
 
     if "binance_testnet" in meta:
         t = meta["binance_testnet"]
-        logger.info(
-            "binance_testnet status=%s endpoint=%s",
-            t.get("status"),
-            t.get("endpoint"),
-        )
+        logger.info("binance_testnet status=%s endpoint=%s", t.get("status"), t.get("endpoint"))
 
     if "binance_testnet_error" in meta:
         logger.info("binance_testnet_error %s", meta["binance_testnet_error"])
@@ -194,6 +259,7 @@ def _build_exchange_clients(
                     state=state,
                     params=demo_pancake[key],
                 )
+
             else:
                 clients[key] = PaperExchangeClient(name=ex, instrument=inst, state=state, fee_rate=0.0005)
 
@@ -202,11 +268,13 @@ def _build_exchange_clients(
 
     return clients
 
+
 def _snapshot_balances(state: BotState) -> Dict[Tuple[str, str], Dict[str, float]]:
     snap: Dict[Tuple[str, str], Dict[str, float]] = {}
     for key, account in state.accounts.items():
-        snap[key] = {str(a).upper(): float(v or 0.0) for a, v in (account.balances or {}).items()}
+        snap[key] = {_norm_asset_key(a): float(v or 0.0) for a, v in (account.balances or {}).items()}
     return snap
+
 
 def _total_equity_usdt_from_snapshot(
     snapshot: Dict[Tuple[str, str], Dict[str, float]],
@@ -221,11 +289,122 @@ def _total_equity_usdt_from_snapshot(
             total += float(amt or 0.0) * float(px)
     return total
 
+
+def _asset_universe_from_config(config: BotConfig) -> set[str]:
+    assets: set[str] = set()
+    for (_ex, _inst), bals in (config.paper_initial_balances or {}).items():
+        assets |= {_norm_asset_key(a) for a in bals.keys()}
+    assets |= {"USDT", "USDC", "WBNB", "BNB", "BTC", "BTCB", "ETH", "WETH", "CAKE", "TWT", "SFP"}
+    return assets
+
+
+def _build_symbol_splitter(quotes: set[str]):
+    # Longest suffix wins (BTCB before BTC)
+    quote_list = sorted({q.upper() for q in quotes}, key=len, reverse=True)
+
+    def split(symbol: str) -> tuple[str, str]:
+        s = "".join(ch for ch in symbol.upper() if ch.isalnum())
+        for q in quote_list:
+            if s.endswith(q) and len(s) > len(q):
+                return s[:-len(q)], q
+        raise ValueError(f"Cannot split symbol={symbol}. quotes={quote_list}")
+
+    return split
+
+
+def _derive_price_usdt_from_opps(
+    opps: Iterable[ArbitrageOpportunity],
+    split_symbol,
+) -> Dict[str, float]:
+    """
+    Build a minimal asset->USDT price map from opportunities.
+    Works best when symbols look like BNBUSDT, ETHUSDT, etc.
+    """
+    px: Dict[str, float] = {"USDT": 1.0, "USDC": 1.0}
+
+    for opp in opps:
+        sym = getattr(opp, "symbol", None)
+        if not sym:
+            continue
+
+        try:
+            base, quote = split_symbol(sym)
+        except Exception:
+            continue
+
+        buy_p = getattr(opp, "buy_price", None)
+        sell_p = getattr(opp, "sell_price", None)
+
+        price: Optional[float] = None
+        if isinstance(buy_p, (int, float)) and isinstance(sell_p, (int, float)):
+            price = (float(buy_p) + float(sell_p)) / 2.0
+        elif isinstance(buy_p, (int, float)):
+            price = float(buy_p)
+        elif isinstance(sell_p, (int, float)):
+            price = float(sell_p)
+
+        if price is None:
+            continue
+
+        quote = quote.upper()
+        base = base.upper()
+
+        if quote in ("USDT", "USDC"):
+            px[base] = price
+
+        # Simple aliases
+        if base == "BNB":
+            px["WBNB"] = px.get("BNB", price)
+        if base == "WBNB":
+            px["BNB"] = px.get("WBNB", price)
+        if base == "ETH":
+            px["WETH"] = px.get("ETH", price)
+        if base == "WETH":
+            px["ETH"] = px.get("WETH", price)
+
+    return px
+
+
+def _total_equity_usdt(state: BotState, price_usdt: Dict[str, float]) -> float:
+    """
+    Mark-to-market total equity in USDT using the provided price map.
+    Missing assets are skipped but logged once.
+    """
+    total = 0.0
+    missing: set[str] = set()
+
+    for account in state.accounts.values():
+        for asset, amt in (account.balances or {}).items():
+            a = _norm_asset_key(asset)
+            q = float(amt or 0.0)
+            if q == 0.0:
+                continue
+
+            px = price_usdt.get(a)
+            if px is None:
+                missing.add(a)
+                continue
+
+            total += q * float(px)
+
+    if missing:
+        logger.info("equity_usdt(mtm) warning: missing prices for assets=%s", ",".join(sorted(missing)))
+
+    return total
+
+
 def _total_usdt_equity(state: BotState) -> float:
+    """
+    Sum of USDT across all accounts (NOT mark-to-market).
+    This is a "realized USDT delta" style metric, not true equity if you hold non-USDT assets.
+    """
     total = 0.0
     for account in state.accounts.values():
-        total += float(account.balances.get("USDT", 0.0) or 0.0)
+        for asset, amt in (account.balances or {}).items():
+            if _norm_asset_key(asset) == "USDT":
+                total += float(amt or 0.0)
     return total
+
 
 def _format_table(headers: List[str], rows: List[List[str]]) -> str:
     widths = [len(h) for h in headers]
@@ -241,76 +420,30 @@ def _format_table(headers: List[str], rows: List[List[str]]) -> str:
     out.extend(fmt_row(r) for r in rows)
     return "\n".join(out)
 
-def _asset_universe_from_config(config: BotConfig) -> set[str]:
-    assets: set[str] = set()
-    for (_ex, _inst), bals in (config.paper_initial_balances or {}).items():
-        assets |= {a.upper() for a in bals.keys()}
-    assets |= {"USDT", "USDC", "WBNB", "BNB", "BTC", "BTCB", "ETH", "WETH", "CAKE", "TWT", "SFP"}
-    return assets
-
-
-def _build_symbol_splitter(quotes: set[str]):
-    # longest suffix wins (BTCB before BTC)
-    quote_list = sorted({q.upper() for q in quotes}, key=len, reverse=True)
-
-    def split(symbol: str) -> tuple[str, str]:
-        s = "".join(ch for ch in symbol.upper() if ch.isalnum())  # "ETH/USDT" 같은 것도 방어
-        for q in quote_list:
-            if s.endswith(q) and len(s) > len(q):
-                return s[:-len(q)], q
-        raise ValueError(f"Cannot split symbol={symbol}. quotes={quote_list}")
-
-    return split
-
 
 def _balances_table(state: BotState, config: BotConfig) -> str:
+    """
+    Show per-account balance changes. Keys are normalized to UPPER strings
+    to avoid "config uses str, state uses enum" mismatch.
+    """
     rows: List[List[str]] = []
 
     for (ex, inst), account in sorted(state.accounts.items(), key=lambda x: (x[0][0], x[0][1])):
-        initial_bal = config.paper_initial_balances.get((ex, inst), {})
-        current_bal = account.balances
+        raw_init = config.paper_initial_balances.get((ex, inst), {}) or {}
+        init = {_norm_asset_key(k): float(v or 0.0) for k, v in raw_init.items()}
 
-        assets = sorted(set(initial_bal.keys()) | set(current_bal.keys()))
+        raw_cur = account.balances or {}
+        cur = {_norm_asset_key(k): float(v or 0.0) for k, v in raw_cur.items()}
+
+        assets = sorted(set(init.keys()) | set(cur.keys()))
         for asset in assets:
-            init = float(initial_bal.get(asset, 0.0) or 0.0)
-            final = float(current_bal.get(asset, 0.0) or 0.0)
-            delta = final - init
-
-            rows.append([
-                ex,
-                inst,
-                asset,
-                f"{init:.8f}",
-                f"{final:.8f}",
-                f"{delta:.8f}",
-            ])
+            init_v = float(init.get(asset, 0.0) or 0.0)
+            cur_v = float(cur.get(asset, 0.0) or 0.0)
+            delta = cur_v - init_v
+            rows.append([ex, inst, asset, f"{init_v:.8f}", f"{cur_v:.8f}", f"{delta:.8f}"])
 
     headers = ["exchange", "instrument", "asset", "initial", "final", "delta"]
     return _format_table(headers, rows)
-
-
-def _total_equity_usdt(state: BotState, price_usdt: Dict[str, float]) -> float:
-    total = 0.0
-    missing: set[str] = set()
-
-    for account in state.accounts.values():
-        for asset, amt in (account.balances or {}).items():
-            a = str(asset).upper()
-            q = float(amt or 0.0)
-            if q == 0.0:
-                continue
-
-            px = price_usdt.get(a)
-            if px is None:
-                missing.add(a)
-                continue
-
-            total += q * px
-
-    if missing:
-        logger.info("equity_usdt warning: missing prices for assets=%s", ",".join(sorted(missing)))
-
-    return total
 
 
 async def run_arbitrage_bot(
@@ -320,6 +453,9 @@ async def run_arbitrage_bot(
     demo_binance_params: Optional[Dict[Tuple[str, str], BinanceDemoParams]] = None,
     demo_pancake_params: Optional[Dict[Tuple[str, str], PancakeDemoParams]] = None,
 ) -> None:
+    # Ensure logging is configured even if this module wasn't imported first in some entrypoints.
+    configure_market_data_client_logging()
+
     logger.info("Starting arbitrage bot mode=%s symbols=%s", config.mode.value, ",".join(config.symbols))
 
     client = _build_market_data_client(config, symbol_mapping)
@@ -335,6 +471,7 @@ async def run_arbitrage_bot(
     )
 
     state = BotState()
+
     split_symbol = _build_symbol_splitter(_asset_universe_from_config(config))
     if demo_pancake_params is not None:
         for (ex, inst), p in list(demo_pancake_params.items()):
@@ -348,16 +485,13 @@ async def run_arbitrage_bot(
         demo_pancake=demo_pancake_params,
     )
 
+    # For final MTM summary (computed only on exit)
     initial_snapshot = _snapshot_balances(state)
     last_price_usdt: Dict[str, float] = {"USDT": 1.0, "USDC": 1.0}
 
-    initial_equity_usdt = 0.0
+    # Per-trade USDT-only delta (not MTM)
     total_realized_pnl_usdt = 0.0
-    total_trades_executed = 0
-
-    if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
-        initial_equity_usdt = _total_usdt_equity(state)
-        logger.info("Initial equity_usdt=%s", f"{initial_equity_usdt:.6f}")
+    opportunities_executed = 0
 
     risk = RiskManager(config=config)
     executor = TradeExecutor(exchange_clients=exchange_clients, risk_manager=risk)
@@ -373,6 +507,8 @@ async def run_arbitrage_bot(
             logger.info("scan=%s time=%s", scan_count, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
             opportunities: List[ArbitrageOpportunity] = await detector.scan_opportunities()
+
+            # Update price map opportunistically
             if opportunities:
                 last_price_usdt = _derive_price_usdt_from_opps(opportunities, split_symbol)
 
@@ -383,7 +519,7 @@ async def run_arbitrage_bot(
             opportunities.sort(key=lambda o: o.net_profit_pct, reverse=True)
 
             for opp in opportunities:
-                equity_before = (
+                equity_before_usdt = (
                     _total_usdt_equity(state)
                     if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO)
                     else None
@@ -396,15 +532,16 @@ async def run_arbitrage_bot(
                     logger.info("execution failed symbol=%s error=%s", opp.symbol, str(exc))
                     continue
 
+                opportunities_executed += 1
+
                 new_trades = state.executed_trades[trades_before:]
                 for t in new_trades:
                     _log_demo_trade(t)
 
                 if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
-                    equity_after = _total_usdt_equity(state)
-                    pnl = equity_after - float(equity_before or 0.0)
-                    total_realized_pnl_usdt += pnl
-                    total_trades_executed += 1
+                    equity_after_usdt = _total_usdt_equity(state)
+                    pnl_usdt = equity_after_usdt - float(equity_before_usdt or 0.0)
+                    total_realized_pnl_usdt += pnl_usdt
 
                     logger.info(
                         "trade_summary symbol=%s path=BUY %s(%s)->SELL %s(%s) theo_net=%s pnl_usdt=%s equity_usdt=%s",
@@ -414,9 +551,10 @@ async def run_arbitrage_bot(
                         opp.sell_exchange,
                         opp.sell_instrument,
                         f"{opp.net_profit_pct:.6f}",
-                        f"{pnl:.6f}",
-                        f"{equity_after:.6f}",
+                        f"{pnl_usdt:.6f}",
+                        f"{equity_after_usdt:.6f}",
                     )
+
             await asyncio.sleep(config.scan_interval)
 
     finally:
@@ -424,23 +562,33 @@ async def run_arbitrage_bot(
         logger.info("MarketDataClient stopped")
 
         if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
-            initial_equity_usdt = _total_equity_usdt_from_snapshot(initial_snapshot, last_price_usdt)
-            final_equity_usdt = _total_equity_usdt(state, last_price_usdt)  # ✅ 여기서만 호출
+            # MTM equity computed ONLY here (on exit)
+            initial_equity_mtm = _total_equity_usdt_from_snapshot(initial_snapshot, last_price_usdt)
+            final_equity_mtm = _total_equity_usdt(state, last_price_usdt)
 
-            pnl_total = final_equity_usdt - initial_equity_usdt
-            roi_pct = (pnl_total / initial_equity_usdt * 100.0) if initial_equity_usdt > 0 else 0.0
+            pnl_total = final_equity_mtm - initial_equity_mtm
+            roi_pct = (pnl_total / initial_equity_mtm * 100.0) if initial_equity_mtm > 0 else 0.0
 
-            logger.info("final_summary mode=%s", config.mode.value)
+            trades_logged = len(state.executed_trades)
+
+            logger.info(
+                "final_summary mode=%s opportunities=%s trades_logged=%s",
+                config.mode.value,
+                opportunities_executed,
+                trades_logged,
+            )
             logger.info(
                 "equity_usdt(mtm) initial=%s final=%s pnl=%s roi_pct=%s",
-                f"{initial_equity_usdt:.6f}",
-                f"{final_equity_usdt:.6f}",
+                f"{initial_equity_mtm:.6f}",
+                f"{final_equity_mtm:.6f}",
                 f"{pnl_total:.6f}",
                 f"{roi_pct:.6f}",
+            )
+            logger.info(
+                "realized_usdt_delta (non-mtm) opportunities=%s pnl_usdt=%s",
+                opportunities_executed,
+                f"{total_realized_pnl_usdt:.6f}",
             )
 
             table = _balances_table(state, config)
             logger.info("balances:\n%s", table)
-
-
-

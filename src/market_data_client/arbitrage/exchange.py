@@ -675,7 +675,7 @@ class BinanceDemoExchangeClient(ExchangeClient):
         base_asset, quote_asset = self._split_symbol(symbol)
         account = self._state.get_or_create_account(self.name, self.instrument)
 
-        # --- Economic layer: update balances using execution_price ---
+        # Economic layer: update balances using execution_price
         if side == OrderSide.BUY:
             cost_quote = qty * execution_price
             if account.balances.get(quote_asset, 0.0) < cost_quote:
@@ -820,7 +820,7 @@ class BinanceDemoExchangeClient(ExchangeClient):
 
         url = base_url + path
 
-        # --- Fetch filters & build candidate qty strings (coarser fallback) ---
+        # Fetch filters & build candidate qty strings (coarser fallback)
         try:
             filters = self._get_testnet_symbol_filters_cached(mode_label, base_url, symbol, order_type)
             step = Decimal(str(filters.get("stepSize", "0") or "0"))
@@ -948,7 +948,7 @@ class BinanceDemoExchangeClient(ExchangeClient):
                     "error": f"HTTPError {exc.code}",
                 }
 
-         # --- Try candidates until success ---
+         # Try candidates until success
         last_err: Optional[Dict[str, Any]] = None
 
         for qty_str in candidates:
@@ -1062,10 +1062,11 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             )
 
         if per_block_meta is not None:
-            all_ok = bool(per_block_meta.get("all_ok", True))
+            ok_count = int(per_block_meta.get("ok_count", 0) or 0)
             avg_fill = per_block_meta.get("avg_fill_price", None)
 
-            if (not all_ok) or (not isinstance(avg_fill, (int, float))) or (avg_fill <= 0):
+            # Require at least one successful swap; do not require all_ok.
+            if ok_count < 1:
                 trade = TradeResult(
                     exchange=self.name,
                     instrument=self.instrument,
@@ -1077,18 +1078,18 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                     base_delta=0.0,
                     quote_delta=0.0,
                     success=False,
-                    message="pancake_demo swap failed (one or more fork swaps reverted)",
+                    message="pancake_demo swap failed (no successful fork swaps)",
                     metadata={"pancake_demo": per_block_meta},
                 )
                 return trade
 
-        # 3) Determine actual execution price used for accounting:
-        #    prefer avg_fill_price from fork, otherwise use theoretical price.
+        # Prefer avg fill price from successful swaps; otherwise fall back to theoretical.
         execution_price = theoretical_price
         if per_block_meta is not None:
             avg_fill = per_block_meta.get("avg_fill_price")
             if isinstance(avg_fill, (int, float)) and avg_fill > 0:
                 execution_price = float(avg_fill)
+
 
         base_asset, quote_asset = resolve_base_quote(symbol)
 
@@ -1242,6 +1243,9 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             fork_block = base_block + offset
             self._wait_for_upstream_block(upstream_web3, fork_block)
 
+            used_reset_method = ""
+            used_impersonate_method = "" 
+
             reset_config = {
                 "forking": {
                     "jsonRpcUrl": self._params.upstream_rpc_url,
@@ -1249,20 +1253,36 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                 }
             }
 
-            # --- Reset fork with fallback (anvil_reset <-> hardhat_reset) ---
-            used_reset_method = ""
+            # Reset fork with fallback (anvil_reset <-> hardhat_reset)
             try:
                 used_reset_method = self._fork_reset_any(provider, reset_config, prefer=fork_engine_pref)
             except Exception as exc:
-                raise RuntimeError(f"fork reset failed at block={fork_block}: {exc}") from exc
+                per_block_results.append({
+                    "fork_block": fork_block,
+                    "tx_hash": "",
+                    "status": 0,
+                    "gas_used": 0,
+                    "reset_method": "",
+                    "impersonate_method": "",
+                    "revert_reason": f"fork_reset_failed: {exc}",
+                })
+                continue
 
-            # --- Impersonate with fallback (only if not local signing) ---
-            used_impersonate_method = ""
             if not use_local_signing:
                 try:
                     used_impersonate_method = self._impersonate_any(provider, trader, prefer=fork_engine_pref)
                 except Exception as exc:
-                    raise RuntimeError(f"impersonate failed for trader={trader}: {exc}") from exc
+                    per_block_results.append({
+                        "fork_block": fork_block,
+                        "tx_hash": "",
+                        "status": 0,
+                        "gas_used": 0,
+                        "reset_method": used_reset_method,
+                        "impersonate_method": "",
+                        "revert_reason": f"impersonate_failed: {exc}",
+                    })
+                    continue
+
 
             # Build swap tx.
             # IMPORTANT: The builder must handle any funding/Permit2 allowance itself.
@@ -1350,7 +1370,7 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                     decimals_in = None
                     decimals_out = None
 
-            # --- FAIL FAST: avoid TRANSFER_FROM_FAILED by checking token_in balance first ---
+            # FAIL FAST: avoid TRANSFER_FROM_FAILED by checking token_in balance first
             # This requires builder to provide `_demo_amount_in_wei`.
             if (
                 token_in_contract is not None
@@ -1504,20 +1524,29 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             "account_snapshot": {"balances": dict(account.balances)},
         }
 
-        all_ok = all(int(r.get("status", 0) or 0) == 1 for r in per_block_results)
-        demo_meta["all_ok"] = all_ok
-        demo_meta["ok_count"] = sum(1 for r in per_block_results if int(r.get("status", 0) or 0) == 1)
-        demo_meta["fail_count"] = len(per_block_results) - demo_meta["ok_count"]
+        ok_count = sum(1 for r in per_block_results if int(r.get("status", 0) or 0) == 1)
+        fail_count = len(per_block_results) - ok_count
 
-        fill_prices = [r["fill_price"] for r in per_block_results if "fill_price" in r]
-        if all_ok and len(fill_prices) == len(per_block_results):
-            demo_meta["avg_fill_price"] = sum(fill_prices) / len(fill_prices)
-        else:
-            demo_meta["avg_fill_price"] = None
+        demo_meta["all_ok"] = (ok_count == len(per_block_results))
+        demo_meta["ok_count"] = ok_count
+        demo_meta["fail_count"] = fail_count
 
-        returns = [r["return_vs_hint"] for r in per_block_results if "return_vs_hint" in r]
-        if returns:
-            demo_meta["avg_return_vs_hint"] = sum(returns) / len(returns)
+        # Average fill price across successful swaps only.
+        ok_fill_prices = [
+            float(r["fill_price"])
+            for r in per_block_results
+            if int(r.get("status", 0) or 0) == 1 and isinstance(r.get("fill_price"), (int, float))
+        ]
+        demo_meta["avg_fill_price"] = (sum(ok_fill_prices) / len(ok_fill_prices)) if ok_fill_prices else None
+
+        ok_returns = [
+            float(r["return_vs_hint"])
+            for r in per_block_results
+            if int(r.get("status", 0) or 0) == 1 and isinstance(r.get("return_vs_hint"), (int, float))
+        ]
+        if ok_returns:
+            demo_meta["avg_return_vs_hint"] = sum(ok_returns) / len(ok_returns)
+
 
         return demo_meta
 
