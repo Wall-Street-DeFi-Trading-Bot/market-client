@@ -1448,6 +1448,28 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             delta_out = None
             fill_price = None
             return_vs_hint = None
+  
+            to_addr = tx_dict.get("to")
+            data = tx_dict.get("data", b"")
+            data_len = len(data) if isinstance(data, (bytes, bytearray)) else len(str(data))
+
+            logger.info(
+                "[pancake-demo] swap_prepare symbol=%s side=%s qty=%.8f hint=%.6f fork_block=%s reset=%s imp=%s from=%s to=%s value=%s gas=%s gasPrice=%s nonce=%s data_len=%s",
+                symbol,
+                side.value,
+                float(quantity),
+                float(price),
+                fork_block,
+                used_reset_method,
+                used_impersonate_method,
+                trader,
+                to_addr,
+                tx_dict.get("value", 0),
+                tx_dict.get("gas"),
+                tx_dict.get("gasPrice", None),
+                tx_dict.get("nonce", None),
+                data_len,
+            )
 
             if (
                 status == 1
