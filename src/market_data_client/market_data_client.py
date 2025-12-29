@@ -28,7 +28,7 @@ if not logger.handlers:
     ))
     logger.addHandler(handler)
 
-# ========================= CSV (fsync) =========================
+# CSV (fsync)
 _csv_lock = asyncio.Lock()
 _csv_writers: Dict[str, csv.DictWriter] = {}
 _csv_files: Dict[str, any] = {}
@@ -83,7 +83,7 @@ async def _csv_close_all():
         _csv_files.clear()
 
 
-# ========================= utils =========================
+# utils
 def _iso_from_ns(ns: int) -> str:
     if not ns:
         return ""
@@ -112,7 +112,7 @@ def _sanitize_for_durable(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_\-\.]", "_", s)[:200]
 
 
-# ========================= data caches =========================
+# data caches
 @dataclasses.dataclass
 class Tick:
     bid: float
@@ -189,7 +189,7 @@ class DexPair:
     lat_publish_ms: Optional[float] = None
 
 
-# ========================= config model =========================
+# config model
 @dataclasses.dataclass
 class CexConfig:
     exchange: str
@@ -206,7 +206,7 @@ class DexConfig:
     want: Iterable[str] = ("tick", "slippage", "fee", "volume")
 
 
-# ========================= client =========================
+# client
 class MarketDataClient:
     """
     생성 시 전달한 (type, exchange, instrument/chain, symbol/PAIR)에 따라 구독을 자동 구성.
@@ -251,7 +251,7 @@ class MarketDataClient:
         self._lock = asyncio.Lock()
         self._listeners = []
 
-    # --------------- lifecycle ---------------
+    # lifecycle
     async def start(self):
         try:
             self.nc = await nats.connect(
@@ -336,7 +336,7 @@ class MarketDataClient:
             except Exception as e:
                 logger.error(f"Listener {cb.__name__} error: {e}", exc_info=True)
 
-    # --------------- subscribe builders ---------------
+    # subscribe builders
     async def _subscribe_cex(self, cfg: CexConfig):
         ex = cfg.exchange
         wants = set(cfg.want)
@@ -390,7 +390,7 @@ class MarketDataClient:
         self._subs.append((subject, sub))
         logger.debug(f"Subscribed to {subject}")
 
-    # --------------- message handler ---------------
+    # message handler
     async def _on_msg(self, subject: str, msg):
         try:
             md = pb.MarketData()
@@ -475,7 +475,7 @@ class MarketDataClient:
                     pass
 
 
-    # --------------- handlers (cache + CSV + emit) ---------------
+    # handlers (cache + CSV + emit)
     async def _h_tick(
         self,
         exchange: str,
@@ -972,7 +972,7 @@ class MarketDataClient:
 
 
 
-    # --------------- simple query APIs ---------------
+    # simple query APIs
     async def get_latest_price(self, symbol: str, exchange: str, instrument: str = "spot") -> Optional[float]:
         sym = _norm_symbol(symbol)
         inst = instrument.lower()
@@ -1138,7 +1138,7 @@ class MarketDataClient:
             }
 
 
-# ========================= helper builders =========================
+# helper builders
 def _dc_copy(obj):
     return dataclasses.replace(obj) if dataclasses.is_dataclass(obj) else deepcopy(obj)
 

@@ -221,6 +221,7 @@ class ArbitrageDetector:
         symbols: Optional[List[str]] = None,
         exchanges: Optional[List[Tuple[str, str]]] = None,
         symbol_mapping: Optional[Dict[str, Dict[str, str]]] = None,
+        fee_overrides: Optional[Dict[Tuple[str, str], float]] = None
     ):
         """
         Initialize the arbitrage detector.
@@ -246,6 +247,13 @@ class ArbitrageDetector:
         # Track opportunities
         self.opportunities: List[ArbitrageOpportunity] = []
         self.opportunity_history: List[ArbitrageOpportunity] = []
+
+        self.fee_overrides = fee_overrides or {
+            ("Binance", "spot"): 0.0004,
+            ("Binance", "perpetual"): 0.0004,
+            ("PancakeSwapV2", "swap"): 0.0025,
+            ("PancakeSwapV3", "swap"): 0.0001,
+        }
     
     def get_available_dex_pairs(self, exchange: str, chain: str = "BSC") -> List[str]:
         """
@@ -399,44 +407,45 @@ class ArbitrageDetector:
             logger.warning(f"  ✗ {exchange} ({instrument}): No price data available")
         return price_data
     
-    async def get_fee_rate(
-        self, 
-        symbol: str, 
-        exchange: str, 
-        instrument: str
-    ) -> float:
+    async def get_fee_rate(self, symbol: str, exchange: str, instrument: str) -> float:
         """
-        Get taker fee rate for a symbol on an exchange.
-        
-        Args:
-            symbol: Canonical trading pair symbol (e.g. "BNBUSDT")
-            exchange: Exchange name
-            instrument: Instrument type
-            
-        Returns:
-            Taker fee rate (e.g., 0.001 for 0.1%)
+        Get taker fee rate.
+        Returns a fraction (e.g. 0.001 for 0.1%).
         """
-        # For DEX, use the mapped DEX pair symbol when available
         symbol_for_fee = symbol
+
+        # For DEX, query meta by mapped pair when present
         if instrument == "swap" and exchange in ["PancakeSwapV2", "PancakeSwapV3", "UniswapV2", "UniswapV3"]:
             if symbol in self.symbol_mapping and exchange in self.symbol_mapping[symbol]:
                 symbol_for_fee = self.symbol_mapping[symbol][exchange]
 
         fee_meta = await self.client.get_fee_meta(symbol_for_fee, exchange, instrument)
         if fee_meta:
-            fee_rate = fee_meta.taker_rate
-            logger.debug(
-                f"  Fee {exchange} ({instrument}) for {symbol_for_fee}: "
-                f"Taker={fee_rate*100:.3f}%, Maker={fee_meta.maker_rate*100:.3f}%"
+            return float(fee_meta.taker_rate)
+
+        # override fallback
+        override = self.fee_overrides.get((exchange, instrument))
+        if override is not None:
+            logger.warning(
+                "  Fee %s (%s) for %s: Using override %.4f%% (meta not available)",
+                exchange,
+                instrument,
+                symbol_for_fee,
+                override * 100,
             )
-            return fee_rate
-        # Default fee if not available (conservative estimate)
-        default_fee = 0.001  # 0.1% default
+            return float(override)
+
+        # last resort
+        default_fee = 0.001
         logger.warning(
-            f"  Fee {exchange} ({instrument}) for {symbol_for_fee}: "
-            f"Using default {default_fee*100:.3f}% (data not available)"
+            "  Fee %s (%s) for %s: Using default %.3f%% (meta not available)",
+            exchange,
+            instrument,
+            symbol_for_fee,
+            default_fee * 100,
         )
         return default_fee
+
     
     async def get_slippage_bps(
         self,
@@ -646,7 +655,7 @@ class ArbitrageDetector:
             for exchange, instrument in self.exchanges:
                 if (exchange, instrument) in prices:
                     fee = await self.get_fee_rate(symbol, exchange, instrument)
-                    slippage = await self.get_slippage_bps(symbol, exchange, trade_size_pct=1.0)
+                    slippage = await self.get_slippage_bps(symbol, exchange, trade_size_pct=0.01)
                     exchange_costs[(exchange, instrument)] = {'fee': fee, 'slippage': slippage}
                     logger.info(f"{exchange:<20} {instrument:<12} {fee*100:<11.3f}% {slippage:<11.6f}bps")
             
@@ -696,11 +705,12 @@ class ArbitrageDetector:
                         # Overwrite with actual slippage
                         opp.buy_slippage = exchange_costs.get((buy_ex, buy_inst), {}).get(
                             'slippage',
-                            await self.get_slippage_bps(symbol, buy_ex, trade_size_pct=1.0),
+                            await self.get_slippage_bps(symbol, buy_ex, trade_size_pct=0.01),
                         )
+
                         opp.sell_slippage = exchange_costs.get((sell_ex, sell_inst), {}).get(
                             'slippage',
-                            await self.get_slippage_bps(symbol, sell_ex, trade_size_pct=1.0),
+                            await self.get_slippage_bps(symbol, sell_ex, trade_size_pct=0.01),
                         )
 
                         

@@ -16,7 +16,6 @@ from market_data_client.arbitrage.pairs import resolve_base_quote
 V3_SWAP_EXACT_IN = 0x00
 V2_SWAP_EXACT_IN = 0x08
 
-
 TOKEN_ADDRESS_MAP: Dict[str, str] = {
     # Wrapped/native aliases
     "WBNB": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
@@ -52,6 +51,7 @@ def build_swap_tx_router_v3(
         price=price,
         quote_asset=quote_asset,
         router_mode="v3",
+        **kwargs,
     )
 
 
@@ -73,6 +73,7 @@ def build_swap_tx_router_v2(
         price=price,
         quote_asset=quote_asset,
         router_mode="v2",
+        **kwargs,
     )
 
 
@@ -119,10 +120,18 @@ def _build_swap_tx_universal_router(
     price: Optional[float],
     quote_asset: str,
     router_mode: str,  # "v2" | "v3"
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     router_address = Web3.to_checksum_address(os.environ["DEMO_PANCAKE_ROUTER_ADDRESS"].strip())
-    priv_key = os.environ["DEMO_PANCAKE_TRADER_PRIVATE_KEY"].strip()
-    trader = Web3.to_checksum_address(Account.from_key(priv_key).address)
+    priv_key = (kwargs.get("private_key") or os.getenv("DEMO_PANCAKE_TRADER_PRIVATE_KEY", "") or "").strip()
+    trader_kw = (kwargs.get("trader") or "").strip()
+
+    if trader_kw:
+        trader = Web3.to_checksum_address(trader_kw)
+    else:
+        if not priv_key:
+            raise ValueError("Missing trader/private_key (pass trader=... or set DEMO_PANCAKE_TRADER_PRIVATE_KEY)")
+        trader = Web3.to_checksum_address(Account.from_key(priv_key).address)
 
     erc20_abi, permit2_abi, router_abi = _load_abis()
     router = web3.eth.contract(address=router_address, abi=router_abi)
@@ -182,17 +191,17 @@ def _build_swap_tx_universal_router(
         erc20_abi=erc20_abi,
     )
 
-    _ensure_allowance(
-        web3=web3,
-        trader=trader,
-        token_in=token_in,
-        permit2_address=permit2_address,
-        router_address=router_address,
-        amount_in=amount_in,
-        private_key=priv_key,
-        erc20_abi=erc20_abi,
-        permit2_abi=permit2_abi,
-    )
+    # _ensure_allowance(
+    #     web3=web3,
+    #     trader=trader,
+    #     token_in=token_in,
+    #     permit2_address=permit2_address,
+    #     router_address=router_address,
+    #     amount_in=amount_in,
+    #     private_key=priv_key,
+    #     erc20_abi=erc20_abi,
+    #     permit2_abi=permit2_abi,
+    # )
 
     amount_out_min = 0
     chain_ts = int(web3.eth.get_block("latest")["timestamp"])
@@ -226,8 +235,9 @@ def _build_swap_tx_universal_router(
     tx: TxParams = {
         "to": router_address,
         "from": trader,
+        "chainId": int(web3.eth.chain_id),
         "data": data,
-        "nonce": web3.eth.get_transaction_count(trader),
+        "nonce": web3.eth.get_transaction_count(trader, "pending"),
         "gas": gas_limit,
         "gasPrice": gas_price,
         "value": 0,
@@ -241,6 +251,11 @@ def _build_swap_tx_universal_router(
     out["_demo_decimals_in"] = decimals_in
     out["_demo_decimals_out"] = decimals_out
     out["_demo_router_mode"] = router_mode
+    out["_demo_router"] = router_address
+    out["_demo_spender"] = permit2_address  # ERC20 approve 대상은 permit2
+    out["_demo_permit2"] = permit2_address  # 이미 있긴 한데 유지
+    out["_demo_gas_token_symbol"] = "BNB"
+
     return out
 
 
@@ -341,19 +356,28 @@ def _search_upwards_for_abi(start: Path) -> Optional[Path]:
             return cand
     return None
 
+def _rpc_ok(provider: Any, method: str, params: list) -> bool:
+    try:
+        resp = provider.make_request(method, params)
+    except Exception:
+        return False
+    return not (isinstance(resp, dict) and resp.get("error"))
 
 def _send_signed_and_wait(web3: Web3, tx: TxParams, private_key: str) -> None:
     """
     Send a locally-signed tx and ensure receipt.status == 1.
     """
-    signed = Account.sign_transaction(tx, private_key)
+    tx2: TxParams = dict(tx)
+    tx2.setdefault("chainId", int(web3.eth.chain_id))
+
+    signed = Account.sign_transaction(tx2, private_key)
     raw_tx = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
     tx_hash = web3.eth.send_raw_transaction(raw_tx)
     receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
+
     status = int(receipt.get("status", 0)) if isinstance(receipt, dict) else int(getattr(receipt, "status", 0))
     if status != 1:
         raise RuntimeError(f"tx reverted: hash={tx_hash.hex()}")
-
 
 def _reverse_lookup_symbol_by_address(token_addr: str) -> Optional[str]:
     token_addr = Web3.to_checksum_address(token_addr)
@@ -364,7 +388,6 @@ def _reverse_lookup_symbol_by_address(token_addr: str) -> Optional[str]:
         except Exception:
             continue
     return None
-
 
 def _fund_test_tokens(
     web3: Web3,
@@ -392,11 +415,8 @@ def _fund_test_tokens(
 
     if native_balance < target_native_wei:
         for method in ("anvil_setBalance", "hardhat_setBalance"):
-            try:
-                provider.make_request(method, [trader, hex(target_native_wei)])
+            if _rpc_ok(provider, method, [trader, hex(target_native_wei)]):
                 break
-            except Exception:
-                pass
 
     wbnb_addr = Web3.to_checksum_address(TOKEN_ADDRESS_MAP["WBNB"])
     usdt_addr = Web3.to_checksum_address(TOKEN_ADDRESS_MAP["USDT"])
@@ -413,27 +433,27 @@ def _fund_test_tokens(
             return
 
         wrap_amount = amount_in - bal_in_raw
-        nonce = web3.eth.get_transaction_count(trader)
 
-        deposit_tx = {
+        # Use pending nonce to avoid "nonce too low" under quick consecutive txs
+        try:
+            nonce = int(web3.eth.get_transaction_count(trader, "pending"))
+        except Exception:
+            nonce = int(web3.eth.get_transaction_count(trader))
+
+        deposit_tx: TxParams = {
             "to": token_in,
             "from": trader,
+            "chainId": int(web3.eth.chain_id),
             "value": wrap_amount,
             "data": "0xd0e30db0",  # deposit()
             "gas": 200000,
             "gasPrice": gas_price,
             "nonce": nonce,
         }
-        signed = Account.sign_transaction(deposit_tx, private_key)
-        raw_tx = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
-        tx_hash = web3.eth.send_raw_transaction(raw_tx)
-        receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-        if int(receipt.get("status", 0)) != 1:
-            raise RuntimeError("WBNB deposit() reverted")
+        _send_signed_and_wait(web3, deposit_tx, private_key)
         return
 
     # ----- ERC20 funding via whale impersonation
-    # USDT uses DEMO_PANCAKE_USDT_WHALE, others use DEMO_PANCAKE_<SYMBOL>_WHALE
     if token_in == usdt_addr:
         whale_env_name = "DEMO_PANCAKE_USDT_WHALE"
     else:
@@ -449,13 +469,10 @@ def _fund_test_tokens(
 
     whale = Web3.to_checksum_address(whale_raw)
 
-    # Give whale gas
+    # Give whale gas (RPC may return {"error":...} without raising)
     for method in ("anvil_setBalance", "hardhat_setBalance"):
-        try:
-            provider.make_request(method, [whale, hex(target_native_wei)])
+        if _rpc_ok(provider, method, [whale, hex(target_native_wei)]):
             break
-        except Exception:
-            pass
 
     bal_trader = int(token_in_contract.functions.balanceOf(trader).call())
     if bal_trader >= amount_in:
@@ -463,7 +480,6 @@ def _fund_test_tokens(
 
     need = amount_in - bal_trader
 
-    # Fail fast: ensure whale has enough token
     bal_whale = int(token_in_contract.functions.balanceOf(whale).call())
     if bal_whale < need:
         raise RuntimeError(
@@ -471,23 +487,30 @@ def _fund_test_tokens(
             f"have={bal_whale} need={need} token={token_in}"
         )
 
-    # impersonate
+    # impersonate (must check resp["error"] too)
     impersonated = False
     for method in ("anvil_impersonateAccount", "hardhat_impersonateAccount"):
-        try:
-            provider.make_request(method, [whale])
+        if _rpc_ok(provider, method, [whale]):
             impersonated = True
             break
-        except Exception:
-            pass
-
     if not impersonated:
         raise RuntimeError(f"Failed to impersonate whale on fork: {whale}")
 
     try:
-        nonce_whale = web3.eth.get_transaction_count(whale)
+        # Use pending nonce for whale too
+        try:
+            nonce_whale = int(web3.eth.get_transaction_count(whale, "pending"))
+        except Exception:
+            nonce_whale = int(web3.eth.get_transaction_count(whale))
+
         transfer_tx = token_in_contract.functions.transfer(trader, need).build_transaction(
-            {"from": whale, "gas": 250000, "gasPrice": gas_price, "nonce": nonce_whale}
+            {
+                "from": whale,
+                "gas": 250000,
+                "gasPrice": gas_price,
+                "nonce": nonce_whale,
+                "chainId": int(web3.eth.chain_id),
+            }
         )
 
         tx_hash = web3.eth.send_transaction(transfer_tx)
@@ -495,18 +518,14 @@ def _fund_test_tokens(
         if int(receipt.get("status", 0)) != 1:
             raise RuntimeError("Whale transfer reverted")
 
-        # Verify
         bal2 = int(token_in_contract.functions.balanceOf(trader).call())
         if bal2 < amount_in:
             raise RuntimeError(f"Funding insufficient after transfer: have={bal2} need={amount_in}")
 
     finally:
         for method in ("anvil_stopImpersonatingAccount", "hardhat_stopImpersonatingAccount"):
-            try:
-                provider.make_request(method, [whale])
+            if _rpc_ok(provider, method, [whale]):
                 break
-            except Exception:
-                pass
 
 
 def _ensure_allowance(
