@@ -84,7 +84,6 @@ async def main() -> None:
             print("\n\n⛔ Force exit.")
             raise KeyboardInterrupt()
 
-    # Register SIGINT handler (Ctrl+C)
     signal.signal(signal.SIGINT, _handle_sigint)
 
     await run_arbitrage_bot(

@@ -1,7 +1,6 @@
-# src/market_data_client/arbitrage/excutor.py
 """
 TradeExecutor: takes ArbitrageOpportunity objects and sends orders
-through ExchangeClient implementations (LIVE or PAPER).
+through ExchangeClient implementations (LIVE / PAPER / DEMO).
 """
 
 from __future__ import annotations
@@ -10,7 +9,7 @@ import logging
 from typing import Dict, Tuple
 
 from .arbitrage_detector import ArbitrageOpportunity
-from .exchange import ExchangeClient, TradeResult
+from .exchange import ExchangeClient, TradeResult, OrderSide
 from .risk import RiskManager
 
 logger = logging.getLogger(__name__)
@@ -18,157 +17,217 @@ logger = logging.getLogger(__name__)
 
 class TradeExecutor:
     """
-    Executes arbitrage trades given detected opportunities.
-
-    It expects a mapping:
-        key: (exchange_name, instrument)
-        value: ExchangeClient instance (live or paper)
+    TradeExecutor wires ArbitrageOpportunity objects to concrete ExchangeClient
+    implementations and runs a simple two-leg arbitrage (BUY then SELL).
     """
 
     def __init__(
         self,
         exchange_clients: Dict[Tuple[str, str], ExchangeClient],
         risk_manager: RiskManager,
-    ):
-        self.exchange_clients = exchange_clients
-        self.risk = risk_manager
+    ) -> None:
+        self._clients = exchange_clients
+        self._risk = risk_manager
 
-    def _get_client(self, exchange: str, instrument: str) -> ExchangeClient:
-        key = (exchange, instrument)
-        if key not in self.exchange_clients:
-            raise KeyError(f"No ExchangeClient registered for {exchange}({instrument})")
-        return self.exchange_clients[key]
-
-    async def execute_opportunity(self, opp: ArbitrageOpportunity) -> Tuple[TradeResult, TradeResult]:
-        """
-        Execute a single arbitrage: buy on buy_exchange, sell on sell_exchange.
-
-        Returns:
-            (buy_trade_result, sell_trade_result)
-
-        Error handling:
-          - If the opportunity is rejected by RiskManager, raises ValueError.
-          - If BUY leg fails (no result / error flag), raises ValueError.
-          - If SELL leg fails (no result / error flag), raises ValueError.
-          In all failure cases this method returns early and the caller
-          must treat the whole arbitrage as "not executed".
-        """
-        # 1) Risk check
-        if not self.risk.is_acceptable(opp):
+    async def execute_opportunity(
+        self,
+        opp: ArbitrageOpportunity,
+    ) -> Tuple[TradeResult, TradeResult]:
+        if not self._risk.is_acceptable(opp):
             logger.info(
-                f"[EXECUTOR] Skipping opportunity {opp.symbol}: net={opp.net_profit_pct:.3f}% "
-                f"below risk threshold."
+                "[EXECUTOR] Opportunity rejected: %s(%s) -> %s(%s)",
+                opp.buy_exchange,
+                opp.buy_instrument,
+                opp.sell_exchange,
+                opp.sell_instrument,
             )
             raise ValueError("Opportunity rejected by risk manager")
 
-        # 2) Compute quantity in base asset
-        qty = self.risk.compute_trade_quantity(opp)
+        qty = self._risk.compute_trade_quantity(opp)
         if qty <= 0:
-            logger.info(
-                f"[EXECUTOR] Computed quantity is 0 for {opp.symbol}, skipping."
-            )
-            raise ValueError("Computed trade quantity <= 0")
+            raise ValueError("Risk manager returned non-positive trade size")
+
+        buy_key = (opp.buy_exchange, opp.buy_instrument)
+        sell_key = (opp.sell_exchange, opp.sell_instrument)
+
+        buy_client = self._clients.get(buy_key)
+        sell_client = self._clients.get(sell_key)
+
+        if buy_client is None:
+            raise ValueError(f"No exchange client configured for {buy_key}")
+        if sell_client is None:
+            raise ValueError(f"No exchange client configured for {sell_key}")
 
         logger.info(
-            f"[EXECUTOR] Executing arbitrage on {opp.symbol}: "
-            f"qty={qty:.6f}, net={opp.net_profit_pct:.3f}% "
-            f"{opp.buy_exchange}({opp.buy_instrument}) -> "
-            f"{opp.sell_exchange}({opp.sell_instrument})"
+            "[EXECUTOR] Executing arbitrage: %s | buy on %s(%s) @ %.6f, "
+            "sell on %s(%s) @ %.6f, qty=%.8f",
+            opp.symbol,
+            opp.buy_exchange,
+            opp.buy_instrument,
+            opp.buy_price,
+            opp.sell_exchange,
+            opp.sell_instrument,
+            opp.sell_price,
+            qty,
         )
 
-        buy_client = self._get_client(opp.buy_exchange, opp.buy_instrument)
-        sell_client = self._get_client(opp.sell_exchange, opp.sell_instrument)
-
-        # 3) BUY leg
+        # BUY leg
         try:
             buy_trade = await buy_client.create_market_order(
                 symbol=opp.symbol,
-                side="buy",
+                side=OrderSide.BUY,
                 quantity=qty,
+                price=opp.buy_price,
+                # For DEX demo clients (Pancake), this clarifies semantics:
+                # "price_hint" is the reference price used for return_vs_hint.
                 price_hint=opp.buy_price,
-                fee_rate=opp.buy_fee,
             )
         except Exception as exc:
             logger.warning(
-                f"[EXECUTOR] BUY leg exception for {opp.symbol} on "
-                f"{opp.buy_exchange}({opp.buy_instrument}): {exc}"
+                "[EXECUTOR] BUY leg exception for %s on %s(%s): %s",
+                opp.symbol,
+                opp.buy_exchange,
+                opp.buy_instrument,
+                exc,
             )
             raise ValueError("BUY leg failed with exception") from exc
 
-        # Treat None / False / ok=False as failure
         if not buy_trade:
-            logger.warning(
-                f"[EXECUTOR] BUY leg failed for {opp.symbol} on "
-                f"{opp.buy_exchange}({opp.buy_instrument}): no trade result returned"
-            )
             raise ValueError("BUY leg failed (no trade result)")
 
-        if hasattr(buy_trade, "ok") and not getattr(buy_trade, "ok"):
+        if getattr(buy_trade, "success", True) is False:
             logger.warning(
-                f"[EXECUTOR] BUY leg failed for {opp.symbol} on "
-                f"{opp.buy_exchange}({opp.buy_instrument}): "
-                f"{getattr(buy_trade, 'error', 'ok == False')}"
-            )
-            raise ValueError("BUY leg failed (ok == False)")
-
-        if hasattr(buy_trade, "success") and not getattr(buy_trade, "success"):
-            logger.warning(
-                "[EXECUTOR] BUY leg failed for %s on %s(%s): %s",
+                "[EXECUTOR] BUY leg failed for %s on %s(%s): %s | %s",
                 opp.symbol,
                 opp.buy_exchange,
                 opp.buy_instrument,
                 getattr(buy_trade, "message", "success == False"),
+                self._summarize_pancake_reverts(buy_trade),
             )
             raise ValueError("BUY leg failed (success == False)")
-    
-        # 4) SELL leg
+
+        self._log_pancake_demo_summary("BUY", buy_trade)
+
+        # SELL leg
         try:
             sell_trade = await sell_client.create_market_order(
                 symbol=opp.symbol,
-                side="sell",
+                side=OrderSide.SELL,
                 quantity=qty,
+                price=opp.sell_price,
                 price_hint=opp.sell_price,
-                fee_rate=opp.sell_fee,
             )
         except Exception as exc:
             logger.warning(
-                f"[EXECUTOR] SELL leg exception for {opp.symbol} on "
-                f"{opp.sell_exchange}({opp.sell_instrument}): {exc}"
+                "[EXECUTOR] SELL leg exception for %s on %s(%s): %s",
+                opp.symbol,
+                opp.sell_exchange,
+                opp.sell_instrument,
+                exc,
             )
-            # In live trading you might want to hedge here.
-            # For now: treat the whole arbitrage as failed.
             raise ValueError("SELL leg failed with exception") from exc
 
         if not sell_trade:
-            logger.warning(
-                f"[EXECUTOR] SELL leg failed for {opp.symbol} on "
-                f"{opp.sell_exchange}({opp.sell_instrument}): no trade result returned"
-            )
             raise ValueError("SELL leg failed (no trade result)")
 
-        if hasattr(sell_trade, "ok") and not getattr(sell_trade, "ok"):
+        if getattr(sell_trade, "success", True) is False:
             logger.warning(
-                f"[EXECUTOR] SELL leg failed for {opp.symbol} on "
-                f"{opp.sell_exchange}({opp.sell_instrument}): "
-                f"{getattr(sell_trade, 'error', 'ok == False')}"
-            )
-            raise ValueError("SELL leg failed (ok == False)")
-
-        if hasattr(sell_trade, "success") and not getattr(sell_trade, "success"):
-            logger.warning(
-                "[EXECUTOR] SELL leg failed for %s on %s(%s): %s",
+                "[EXECUTOR] SELL leg failed for %s on %s(%s): %s | %s",
                 opp.symbol,
                 opp.sell_exchange,
                 opp.sell_instrument,
                 getattr(sell_trade, "message", "success == False"),
+                self._summarize_pancake_reverts(sell_trade),
             )
             raise ValueError("SELL leg failed (success == False)")
-        
-        # 5) Both legs succeeded: log and return
+
+        self._log_pancake_demo_summary("SELL", sell_trade)
+
         logger.info(
-            f"[EXECUTOR] Done: buy @ {buy_trade.price:.4f} on {buy_trade.exchange}, "
-            f"sell @ {sell_trade.price:.4f} on {sell_trade.exchange}"
+            "[EXECUTOR] Done: buy @ %.6f on %s, sell @ %.6f on %s",
+            float(getattr(buy_trade, "price", 0.0) or 0.0),
+            getattr(buy_trade, "exchange", "?"),
+            float(getattr(sell_trade, "price", 0.0) or 0.0),
+            getattr(sell_trade, "exchange", "?"),
         )
 
         return buy_trade, sell_trade
 
+    @staticmethod
+    def _summarize_pancake_reverts(trade: TradeResult) -> str:
+        """
+        Summarize per-block revert reasons from Pancake demo metadata.
+        """
+        meta = (trade.metadata or {}).get("pancake_demo") or {}
+        rows = meta.get("per_block_results") or []
+        fails = [r for r in rows if int(r.get("status", 0) or 0) != 1]
+
+        if not fails:
+            return "no per-block failures"
+
+        parts = []
+        for r in fails[:5]:
+            reason = r.get("revert_reason")
+            if isinstance(reason, str) and len(reason) > 180:
+                reason = reason[:180] + "..."
+            parts.append(
+                f"block={r.get('fork_block')} status={r.get('status')} reason={reason}"
+            )
+        return " | ".join(parts)
+
+    @staticmethod
+    def _log_pancake_demo_summary(leg: str, trade: TradeResult) -> None:
+        """
+        Log a compact summary when the trade has pancake_demo metadata.
+
+        If avg_* fields are missing, compute from per_block_results.
+        """
+        meta = (trade.metadata or {}).get("pancake_demo") or {}
+        if not meta:
+            return
+
+        rows = meta.get("per_block_results") or []
+        ok_rows = [r for r in rows if int(r.get("status", 0) or 0) == 1]
+
+        # Counts
+        ok = int(meta.get("ok_count", len(ok_rows)) or 0)
+        fail = int(meta.get("fail_count", max(0, len(rows) - len(ok_rows))) or 0)
+
+        # avg_fill: prefer meta, else compute from per-block fill_price
+        avg_fill = meta.get("avg_fill_price", None)
+        if not isinstance(avg_fill, (int, float)):
+            fills = [
+                float(r.get("fill_price"))
+                for r in ok_rows
+                if isinstance(r.get("fill_price"), (int, float))
+            ]
+            avg_fill = (sum(fills) / len(fills)) if fills else None
+
+        # avg_return_vs_hint: prefer net return if present, else meta avg, else compute from per-block
+        avg_rvh = None
+        for k in (
+            "avg_net_return_vs_hint_incl_gas",
+            "avg_net_return_vs_hint_excl_gas",
+            "avg_return_vs_hint",
+        ):
+            v = meta.get(k, None)
+            if isinstance(v, (int, float)):
+                avg_rvh = float(v)
+                break
+
+        if avg_rvh is None:
+            rvhs = [
+                float(r.get("return_vs_hint"))
+                for r in ok_rows
+                if isinstance(r.get("return_vs_hint"), (int, float))
+            ]
+            avg_rvh = (sum(rvhs) / len(rvhs)) if rvhs else None
+
+        logger.info(
+            "[EXECUTOR] %s pancake_demo: ok=%s fail=%s avg_fill=%s avg_return_vs_hint=%s",
+            leg,
+            ok,
+            fail,
+            f"{float(avg_fill):.8f}" if isinstance(avg_fill, (int, float)) else "n/a",
+            f"{float(avg_rvh):+.6%}" if isinstance(avg_rvh, (int, float)) else "n/a",
+        )
