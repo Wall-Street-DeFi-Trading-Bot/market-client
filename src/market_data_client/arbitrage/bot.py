@@ -56,7 +56,6 @@ def configure_market_data_client_logging(level: int = logging.INFO) -> None:
     if _LOGGING_CONFIGURED:
         return
 
-    # Dedupe root handlers (people often attach multiple StreamHandlers)
     root = logging.getLogger()
     _dedupe_logger_handlers(root)
 
@@ -76,7 +75,6 @@ def configure_market_data_client_logging(level: int = logging.INFO) -> None:
     pkg.setLevel(level)
     pkg.propagate = False
 
-    # Clear handlers of existing child loggers and make them bubble to package logger
     for name, obj in logging.root.manager.loggerDict.items():
         if not isinstance(obj, logging.Logger):
             continue
@@ -88,7 +86,6 @@ def configure_market_data_client_logging(level: int = logging.INFO) -> None:
     _LOGGING_CONFIGURED = True
 
 
-# Configure on import (idempotent). If you configure elsewhere, it still won't double-configure.
 configure_market_data_client_logging()
 
 
@@ -96,16 +93,308 @@ def _norm_asset_key(a: Any) -> str:
     return str(a).upper()
 
 
+def _avg(xs: List[Optional[float]]) -> Optional[float]:
+    ys = [float(x) for x in xs if isinstance(x, (int, float))]
+    return (sum(ys) / len(ys)) if ys else None
+
+
+def _sum(xs: List[Optional[float]]) -> Optional[float]:
+    ys = [float(x) for x in xs if isinstance(x, (int, float))]
+    return sum(ys) if ys else None
+
+
+def _fmt_pct(x: Optional[float]) -> str:
+    if x is None:
+        return "None"
+    return f"{x * 100:.6f}%"
+
+
+def _fmt_money(x: Optional[float]) -> str:
+    if x is None:
+        return "None"
+    return f"{x:.10f}"
+
+
+def _pick_num(d: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return None
+
+
+def _dedupe_per_block_results(per: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    per_block_results may contain duplicated rows (same fork_block + same tx)
+    and sometimes one of those duplicates has missing fields (None).
+    Keep only the "best" row per key.
+    """
+    best: Dict[Tuple[Any, Any], Dict[str, Any]] = {}
+
+    for r in per:
+        if not isinstance(r, dict):
+            continue
+
+        fb = r.get("fork_block")
+        txh = r.get("tx_hash") or r.get("tx")
+
+        key = (fb, txh)
+
+        fee_q = _pick_num(r, ["fee_quote"])
+        approve_g = _pick_num(r, ["approve_gas_cost_native", "approve_gas_native", "approve_gas_native_bnb"])
+        total_g = _pick_num(r, ["total_gas_cost_native", "total_gas_native", "total_gas_native_bnb"])
+        rvh_bps = _pick_num(r, ["return_vs_hint_bps", "slip_bps"])
+        if rvh_bps is None:
+            rvh = _pick_num(r, ["return_vs_hint"])
+            if isinstance(rvh, (int, float)):
+                rvh_bps = float(rvh) * 10000.0
+
+        # Skip completely empty rows (prevents None spam)
+        if fee_q is None and approve_g is None and total_g is None and rvh_bps is None:
+            continue
+
+        score = (
+            (1 if fee_q is not None else 0)
+            + (1 if approve_g is not None else 0)
+            + (1 if total_g is not None else 0)
+            + (1 if rvh_bps is not None else 0)
+        )
+
+        prev = best.get(key)
+        if prev is None or score > prev.get("_score", -1):
+            r2 = dict(r)
+            r2["_score"] = score
+            best[key] = r2
+
+    out = list(best.values())
+    out.sort(key=lambda x: (x.get("fork_block") is None, x.get("fork_block")))
+    for r in out:
+        r.pop("_score", None)
+    return out
+
+
+def _extract_dex_summary(p: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    raw_per = p.get("per_block_results") or []
+    per = _dedupe_per_block_results(raw_per) if isinstance(raw_per, list) else []
+
+    def pick_avg_any(keys: List[str]) -> Optional[float]:
+        for k in keys:
+            v = p.get(k)
+            if isinstance(v, (int, float)):
+                return float(v)
+        for k in keys:
+            v = _avg([r.get(k) for r in per])
+            if isinstance(v, (int, float)):
+                return float(v)
+        return None
+
+    def sum_per_any(keys: List[str]) -> Optional[float]:
+        # Only sum from per-block rows (avoid misreading avg fields from p)
+        for k in keys:
+            v = _sum([r.get(k) for r in per])
+            if isinstance(v, (int, float)):
+                return float(v)
+        return None
+
+    fee_quote_avg = pick_avg_any(["avg_fee_quote", "fee_quote"])
+    swap_pnl_quote_avg = pick_avg_any(["avg_swap_pnl_quote", "swap_pnl_quote"])
+
+    slip_bps_avg = pick_avg_any(["avg_slip_bps"])
+    if slip_bps_avg is None:
+        rvh = pick_avg_any(["avg_return_vs_hint", "return_vs_hint"])
+        if isinstance(rvh, (int, float)):
+            slip_bps_avg = float(rvh) * 10000.0
+
+    approve_gas_native_avg = pick_avg_any(
+        ["avg_approve_gas_native", "approve_gas_cost_native", "approve_gas_native"]
+    )
+    total_gas_native_avg = pick_avg_any(
+        ["avg_total_gas_native", "total_gas_cost_native", "total_gas_native"]
+    )
+
+    # Sum across 3 runs (fork blocks) from per-block rows
+    total_gas_native_sum = sum_per_any(["total_gas_cost_native", "total_gas_native"])
+
+    net_excl_gas = pick_avg_any(["avg_net_return_excl_gas", "net_return_excl_gas"])
+    pnl_excl_gas = pick_avg_any(["avg_net_pnl_quote_excl_gas", "net_pnl_quote_excl_gas"])
+
+    return {
+        "fee_quote_avg": fee_quote_avg,
+        "swap_pnl_quote_avg": swap_pnl_quote_avg,
+        "slip_bps_avg": slip_bps_avg,
+        "approve_gas_native_avg": approve_gas_native_avg,
+        "total_gas_native_avg": total_gas_native_avg,
+        "total_gas_native_sum": total_gas_native_sum,
+        "net_return_excl_gas": net_excl_gas,
+        "net_pnl_quote_excl_gas": pnl_excl_gas,
+    }
+
+
+def _extract_cex_summary(b: Dict[str, Any], side_val: str, qty: Optional[float]) -> Dict[str, Optional[float]]:
+    theo = b.get("theoretical_price")
+    execp = b.get("execution_price")
+    fee_rate = b.get("fee_rate")
+    if not (
+        isinstance(theo, (int, float))
+        and isinstance(execp, (int, float))
+        and isinstance(fee_rate, (int, float))
+        and isinstance(qty, (int, float))
+    ):
+        return {
+            "fee_quote": None,
+            "net_return_excl_gas": None,
+            "net_pnl_quote_excl_gas": None,
+            "slip_bps": b.get("slippage_bps"),
+        }
+
+    theo_f = float(theo)
+    execp_f = float(execp)
+    fee_rate_f = float(fee_rate)
+    qty_f = float(qty)
+
+    expected = theo_f * qty_f
+    actual = execp_f * qty_f
+
+    if side_val.upper() == "BUY":
+        pnl_quote = expected - actual
+    else:
+        pnl_quote = actual - expected
+
+    fee_quote = abs(actual) * fee_rate_f
+    net_pnl = pnl_quote - fee_quote
+    net_ret = (net_pnl / expected) if expected > 0 else None
+
+    return {
+        "fee_quote": fee_quote,
+        "net_return_excl_gas": net_ret,
+        "net_pnl_quote_excl_gas": net_pnl,
+        "slip_bps": b.get("slippage_bps"),
+    }
+
+
+def _trade_cost_breakdown(trade: Any) -> Dict[str, float]:
+    """
+    Returns:
+      - fee_quote (USDT quote)
+      - approve_gas_avg_bnb (BNB, avg across 3 runs in demo)
+      - gas_avg_bnb (BNB, avg total gas across 3 runs in demo)
+      - gas_sum_3runs_bnb (BNB, sum total gas across 3 runs in demo)
+    """
+    meta = getattr(trade, "metadata", None) or {}
+
+    out = {
+        "fee_quote": 0.0,
+        "approve_gas_avg_bnb": 0.0,
+        "gas_avg_bnb": 0.0,
+        "gas_sum_3runs_bnb": 0.0,
+    }
+
+    if "pancake_demo" in meta:
+        d = _extract_dex_summary(meta["pancake_demo"])
+        out["fee_quote"] = float(d.get("fee_quote_avg") or 0.0)
+        out["approve_gas_avg_bnb"] = float(d.get("approve_gas_native_avg") or 0.0)
+        out["gas_avg_bnb"] = float(d.get("total_gas_native_avg") or 0.0)
+        out["gas_sum_3runs_bnb"] = float(d.get("total_gas_native_sum") or 0.0)
+        return out
+
+    if "binance_demo" in meta:
+        side = getattr(trade, "side", "?")
+        side_val = getattr(side, "value", str(side))
+        qty = getattr(trade, "quantity", None)
+
+        b = meta["binance_demo"]
+        s = _extract_cex_summary(b, side_val, float(qty) if isinstance(qty, (int, float)) else None)
+        out["fee_quote"] = float(s.get("fee_quote") or 0.0)
+        return out
+
+    return out
+
+
+def _log_pancake_per_blocks(trade: Any) -> None:
+    """
+    Single place to print pancake_block lines.
+    - Dedupes duplicated rows.
+    - Skips rows that are all None (prevents None spam).
+    """
+    meta = getattr(trade, "metadata", None) or {}
+    p = meta.get("pancake_demo")
+    if not isinstance(p, dict):
+        return
+
+    raw_per = p.get("per_block_results") or []
+    if not isinstance(raw_per, list) or not raw_per:
+        return
+
+    per = _dedupe_per_block_results(raw_per)
+    if not per:
+        return
+
+    for r in per:
+        fb = r.get("fork_block")
+        status = r.get("status")
+        txh = r.get("tx_hash") or r.get("tx")
+
+        fee_q = _pick_num(r, ["fee_quote"])
+        approve_g = _pick_num(r, ["approve_gas_cost_native", "approve_gas_native", "approve_gas_native_bnb"])
+        total_g = _pick_num(r, ["total_gas_cost_native", "total_gas_native", "total_gas_native_bnb"])
+
+        rvh_bps = _pick_num(r, ["return_vs_hint_bps", "slip_bps"])
+        if rvh_bps is None:
+            rvh = _pick_num(r, ["return_vs_hint"])
+            if isinstance(rvh, (int, float)):
+                rvh_bps = float(rvh) * 10000.0
+
+        logger.info(
+            "pancake_block fork_block=%s status=%s tx_hash=%s fee_quote=%s "
+            "approve_gas_native_bnb=%s total_gas_native_bnb=%s return_vs_hint_bps=%s",
+            fb,
+            status,
+            txh,
+            f"{fee_q:.10f}" if isinstance(fee_q, (int, float)) else "None",
+            f"{approve_g:.10f}" if isinstance(approve_g, (int, float)) else "None",
+            f"{total_g:.10f}" if isinstance(total_g, (int, float)) else "None",
+            f"{rvh_bps:.3f}" if isinstance(rvh_bps, (int, float)) else "None",
+        )
+
+
+def _trade_fee_gas_native(t: Any) -> Tuple[float, float]:
+    """
+    Returns (fee_quote, gas_native_bnb_avg_per_tx).
+
+    - CEX: fee_quote from binance_demo, gas_native_bnb = 0
+    - DEX(BSC Pancake): fee_quote(avg) + gas_native_bnb(avg)
+      NOTE: fee_quote is in quote token units, gas is in BNB units (different unit).
+    """
+    meta = getattr(t, "metadata", None) or {}
+
+    if "binance_demo" in meta:
+        side = getattr(t, "side", "?")
+        side_val = getattr(side, "value", str(side))
+        qty = getattr(t, "quantity", None)
+
+        b = meta["binance_demo"]
+        s = _extract_cex_summary(b, side_val, float(qty) if isinstance(qty, (int, float)) else None)
+        fee_q = float(s.get("fee_quote") or 0.0)
+        return fee_q, 0.0
+
+    if "pancake_demo" in meta:
+        p = meta["pancake_demo"]
+        d = _extract_dex_summary(p)
+        fee_q = float(d.get("fee_quote_avg") or 0.0)
+        gas_bnb = float(d.get("total_gas_native_avg") or 0.0)
+        return fee_q, gas_bnb
+
+    return 0.0, 0.0
+
+
 def _log_demo_trade(trade: Any) -> None:
-    """
-    Log DEMO trade metadata in a compact, human-friendly way.
-    """
     meta = getattr(trade, "metadata", None) or {}
 
     ex = getattr(trade, "exchange", "?")
     inst = getattr(trade, "instrument", "?")
     sym = getattr(trade, "symbol", "?")
     side = getattr(trade, "side", "?")
+    side_val = getattr(side, "value", str(side))
     qty = getattr(trade, "quantity", None)
     px = getattr(trade, "price", None)
 
@@ -114,44 +403,41 @@ def _log_demo_trade(trade: Any) -> None:
         ex,
         inst,
         sym,
-        getattr(side, "value", side),
+        side_val,
         f"{qty:.8f}" if isinstance(qty, (int, float)) else str(qty),
         f"{px:.8f}" if isinstance(px, (int, float)) else str(px),
     )
 
     if "binance_demo" in meta:
         b = meta["binance_demo"]
+        s = _extract_cex_summary(b, side_val, float(qty) if isinstance(qty, (int, float)) else None)
         logger.info(
-            "binance_demo theoretical_price=%s execution_price=%s slippage_bps=%s fee_rate=%s",
-            b.get("theoretical_price"),
-            b.get("execution_price"),
-            b.get("slippage_bps"),
-            b.get("fee_rate"),
+            "cex_metrics slip_bps=%s fee_quote=%s net_excl_gas=%s pnl_excl_gas=%s",
+            s.get("slip_bps"),
+            _fmt_money(s.get("fee_quote")),
+            _fmt_pct(s.get("net_return_excl_gas")),
+            _fmt_money(s.get("net_pnl_quote_excl_gas")),
         )
-
-    if "binance_testnet" in meta:
-        t = meta["binance_testnet"]
-        logger.info("binance_testnet status=%s endpoint=%s", t.get("status"), t.get("endpoint"))
-
-    if "binance_testnet_error" in meta:
-        logger.info("binance_testnet_error %s", meta["binance_testnet_error"])
 
     if "pancake_demo" in meta:
         p = meta["pancake_demo"]
-        avg_fill = p.get("avg_fill_price")
-        avg_ret = p.get("avg_return_vs_hint")
-        logger.info("pancake_demo avg_fill_price=%s avg_return_vs_hint=%s", avg_fill, avg_ret)
+        d = _extract_dex_summary(p)
 
-        per_block = p.get("per_block_results") or []
-        for r in per_block:
-            logger.info(
-                "pancake_block fork_block=%s status=%s fill_price=%s return_vs_hint=%s tx_hash=%s",
-                r.get("fork_block"),
-                r.get("status"),
-                r.get("fill_price"),
-                r.get("return_vs_hint"),
-                r.get("tx_hash"),
-            )
+        logger.info(
+            "dex_summary slip_bps=%s fee_quote(avg)=%s "
+            "approve_gas_native(avg_bnb)=%s total_gas_native(avg_bnb)=%s total_gas_native(sum_3runs_bnb)=%s "
+            "pnl_excl_gas=%s net_excl_gas=%s",
+            (f"{d.get('slip_bps_avg'):.3f}" if isinstance(d.get("slip_bps_avg"), (int, float)) else "None"),
+            _fmt_money(d.get("fee_quote_avg")),
+            _fmt_money(d.get("approve_gas_native_avg")),
+            _fmt_money(d.get("total_gas_native_avg")),
+            _fmt_money(d.get("total_gas_native_sum")),
+            _fmt_money(d.get("net_pnl_quote_excl_gas")),
+            _fmt_pct(d.get("net_return_excl_gas")),
+        )
+
+        # NOTE: only print pancake_block here (deduped + None-safe)
+        _log_pancake_per_blocks(trade)
 
 
 def _build_market_data_client(
@@ -299,14 +585,13 @@ def _asset_universe_from_config(config: BotConfig) -> set[str]:
 
 
 def _build_symbol_splitter(quotes: set[str]):
-    # Longest suffix wins (BTCB before BTC)
     quote_list = sorted({q.upper() for q in quotes}, key=len, reverse=True)
 
     def split(symbol: str) -> tuple[str, str]:
         s = "".join(ch for ch in symbol.upper() if ch.isalnum())
         for q in quote_list:
             if s.endswith(q) and len(s) > len(q):
-                return s[:-len(q)], q
+                return s[: -len(q)], q
         raise ValueError(f"Cannot split symbol={symbol}. quotes={quote_list}")
 
     return split
@@ -316,10 +601,6 @@ def _derive_price_usdt_from_opps(
     opps: Iterable[ArbitrageOpportunity],
     split_symbol,
 ) -> Dict[str, float]:
-    """
-    Build a minimal asset->USDT price map from opportunities.
-    Works best when symbols look like BNBUSDT, ETHUSDT, etc.
-    """
     px: Dict[str, float] = {"USDT": 1.0, "USDC": 1.0}
 
     for opp in opps:
@@ -352,7 +633,6 @@ def _derive_price_usdt_from_opps(
         if quote in ("USDT", "USDC"):
             px[base] = price
 
-        # Simple aliases
         if base == "BNB":
             px["WBNB"] = px.get("BNB", price)
         if base == "WBNB":
@@ -366,10 +646,6 @@ def _derive_price_usdt_from_opps(
 
 
 def _total_equity_usdt(state: BotState, price_usdt: Dict[str, float]) -> float:
-    """
-    Mark-to-market total equity in USDT using the provided price map.
-    Missing assets are skipped but logged once.
-    """
     total = 0.0
     missing: set[str] = set()
 
@@ -394,10 +670,6 @@ def _total_equity_usdt(state: BotState, price_usdt: Dict[str, float]) -> float:
 
 
 def _total_usdt_equity(state: BotState) -> float:
-    """
-    Sum of USDT across all accounts (NOT mark-to-market).
-    This is a "realized USDT delta" style metric, not true equity if you hold non-USDT assets.
-    """
     total = 0.0
     for account in state.accounts.values():
         for asset, amt in (account.balances or {}).items():
@@ -422,10 +694,6 @@ def _format_table(headers: List[str], rows: List[List[str]]) -> str:
 
 
 def _balances_table(state: BotState, config: BotConfig) -> str:
-    """
-    Show per-account balance changes. Keys are normalized to UPPER strings
-    to avoid "config uses str, state uses enum" mismatch.
-    """
     rows: List[List[str]] = []
 
     for (ex, inst), account in sorted(state.accounts.items(), key=lambda x: (x[0][0], x[0][1])):
@@ -453,10 +721,13 @@ async def run_arbitrage_bot(
     demo_binance_params: Optional[Dict[Tuple[str, str], BinanceDemoParams]] = None,
     demo_pancake_params: Optional[Dict[Tuple[str, str], PancakeDemoParams]] = None,
 ) -> None:
-    # Ensure logging is configured even if this module wasn't imported first in some entrypoints.
     configure_market_data_client_logging()
 
-    logger.info("Starting arbitrage bot mode=%s symbols=%s", config.mode.value, ",".join(config.symbols))
+    logger.info(
+        "Starting arbitrage bot mode=%s symbols=%s",
+        config.mode.value,
+        ",".join(config.symbols),
+    )
 
     client = _build_market_data_client(config, symbol_mapping)
     await client.start()
@@ -485,12 +756,19 @@ async def run_arbitrage_bot(
         demo_pancake=demo_pancake_params,
     )
 
-    # For final MTM summary (computed only on exit)
     initial_snapshot = _snapshot_balances(state)
     last_price_usdt: Dict[str, float] = {"USDT": 1.0, "USDC": 1.0}
 
-    # Per-trade USDT-only delta (not MTM)
     total_realized_pnl_usdt = 0.0
+
+    # Cumulative report (gas is tracked in native BNB)
+    cum_fee_quote = 0.0
+    cum_gas_avg_bnb = 0.0
+    cum_gas_sum_3runs_bnb = 0.0
+    cum_gross_pnl_quote = 0.0
+    cum_net_after_fee_quote = 0.0
+    cum_notional_quote = 0.0
+
     opportunities_executed = 0
 
     risk = RiskManager(config=config)
@@ -508,7 +786,6 @@ async def run_arbitrage_bot(
 
             opportunities: List[ArbitrageOpportunity] = await detector.scan_opportunities()
 
-            # Update price map opportunistically
             if opportunities:
                 last_price_usdt = _derive_price_usdt_from_opps(opportunities, split_symbol)
 
@@ -536,12 +813,88 @@ async def run_arbitrage_bot(
 
                 new_trades = state.executed_trades[trades_before:]
                 for t in new_trades:
+                    # NOTE: pancake_block logs are printed ONLY inside _log_demo_trade now.
                     _log_demo_trade(t)
 
                 if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
                     equity_after_usdt = _total_usdt_equity(state)
                     pnl_usdt = equity_after_usdt - float(equity_before_usdt or 0.0)
                     total_realized_pnl_usdt += pnl_usdt
+
+                    buy_trade = next(
+                        (t for t in new_trades if getattr(getattr(t, "side", None), "value", None) == "BUY"),
+                        None,
+                    )
+                    sell_trade = next(
+                        (t for t in new_trades if getattr(getattr(t, "side", None), "value", None) == "SELL"),
+                        None,
+                    )
+
+                    if buy_trade and sell_trade:
+                        qty0 = float(getattr(buy_trade, "quantity", 0.0) or 0.0)
+                        buy_px = float(getattr(buy_trade, "price", 0.0) or 0.0)
+                        sell_px = float(getattr(sell_trade, "price", 0.0) or 0.0)
+
+                        notional_quote = buy_px * qty0
+                        swap_profit_quote = (sell_px - buy_px) * qty0
+
+                        buy_cost = _trade_cost_breakdown(buy_trade)
+                        sell_cost = _trade_cost_breakdown(sell_trade)
+
+                        fee_buy = float(buy_cost["fee_quote"] or 0.0)
+                        fee_sell = float(sell_cost["fee_quote"] or 0.0)
+                        fee_total = fee_buy + fee_sell
+
+                        approve_buy_avg = float(buy_cost["approve_gas_avg_bnb"] or 0.0)
+                        approve_sell_avg = float(sell_cost["approve_gas_avg_bnb"] or 0.0)
+                        approve_total_avg = approve_buy_avg + approve_sell_avg
+
+                        gas_buy_avg = float(buy_cost["gas_avg_bnb"] or 0.0)
+                        gas_sell_avg = float(sell_cost["gas_avg_bnb"] or 0.0)
+                        gas_total_avg = gas_buy_avg + gas_sell_avg
+
+                        gas_buy_sum = float(buy_cost["gas_sum_3runs_bnb"] or 0.0)
+                        gas_sell_sum = float(sell_cost["gas_sum_3runs_bnb"] or 0.0)
+                        gas_total_sum = gas_buy_sum + gas_sell_sum
+
+                        net_after_fee_quote = swap_profit_quote - fee_total
+                        ret_after_fee = (net_after_fee_quote / notional_quote) if notional_quote > 0 else 0.0
+
+                        logger.info(
+                            "final_return symbol=%s qty=%s notional_quote=%s "
+                            "swap_profit_quote=%s "
+                            "fee_quote buy=%s sell=%s total=%s "
+                            "approve_gas_avg_bnb buy=%s sell=%s total=%s "
+                            "gas_avg_bnb buy=%s sell=%s total=%s "
+                            "gas_sum_3runs_bnb buy=%s sell=%s total=%s "
+                            "net_after_fee_quote=%s ret_after_fee_pct=%s",
+                            opp.symbol,
+                            f"{qty0:.8f}",
+                            f"{notional_quote:.10f}",
+                            f"{swap_profit_quote:.10f}",
+                            f"{fee_buy:.10f}",
+                            f"{fee_sell:.10f}",
+                            f"{fee_total:.10f}",
+                            f"{approve_buy_avg:.10f}",
+                            f"{approve_sell_avg:.10f}",
+                            f"{approve_total_avg:.10f}",
+                            f"{gas_buy_avg:.10f}",
+                            f"{gas_sell_avg:.10f}",
+                            f"{gas_total_avg:.10f}",
+                            f"{gas_buy_sum:.10f}",
+                            f"{gas_sell_sum:.10f}",
+                            f"{gas_total_sum:.10f}",
+                            f"{net_after_fee_quote:.10f}",
+                            f"{ret_after_fee * 100.0:.6f}%",
+                        )
+
+                        # Cumulative
+                        cum_fee_quote += fee_total
+                        cum_gas_avg_bnb += gas_total_avg
+                        cum_gas_sum_3runs_bnb += gas_total_sum
+                        cum_gross_pnl_quote += swap_profit_quote
+                        cum_net_after_fee_quote += net_after_fee_quote
+                        cum_notional_quote += notional_quote
 
                     logger.info(
                         "trade_summary symbol=%s path=BUY %s(%s)->SELL %s(%s) theo_net=%s pnl_usdt=%s equity_usdt=%s",
@@ -562,7 +915,6 @@ async def run_arbitrage_bot(
         logger.info("MarketDataClient stopped")
 
         if config.mode in (ExecutionMode.PAPER, ExecutionMode.DEMO):
-            # MTM equity computed ONLY here (on exit)
             initial_equity_mtm = _total_equity_usdt_from_snapshot(initial_snapshot, last_price_usdt)
             final_equity_mtm = _total_equity_usdt(state, last_price_usdt)
 
@@ -591,4 +943,19 @@ async def run_arbitrage_bot(
             )
 
             table = _balances_table(state, config)
+
+            ret_after_fee_total = (cum_net_after_fee_quote / cum_notional_quote) if cum_notional_quote > 0 else 0.0
+
+            logger.info(
+                "cumulative_report fee_total_quote=%s gas_total_avg_native_bnb=%s gas_total_sum_3runs_bnb=%s "
+                "gross_pnl_quote=%s net_after_fee_quote=%s ret_after_fee_pct=%s notional_quote=%s",
+                f"{cum_fee_quote:.10f}",
+                f"{cum_gas_avg_bnb:.10f}",
+                f"{cum_gas_sum_3runs_bnb:.10f}",
+                f"{cum_gross_pnl_quote:.10f}",
+                f"{cum_net_after_fee_quote:.10f}",
+                f"{ret_after_fee_total * 100.0:.6f}%",
+                f"{cum_notional_quote:.10f}",
+            )
+
             logger.info("balances:\n%s", table)

@@ -191,17 +191,18 @@ def _build_swap_tx_universal_router(
         erc20_abi=erc20_abi,
     )
 
-    # _ensure_allowance(
-    #     web3=web3,
-    #     trader=trader,
-    #     token_in=token_in,
-    #     permit2_address=permit2_address,
-    #     router_address=router_address,
-    #     amount_in=amount_in,
-    #     private_key=priv_key,
-    #     erc20_abi=erc20_abi,
-    #     permit2_abi=permit2_abi,
-    # )
+    approve_meta = _ensure_allowance(
+        web3=web3,
+        trader=trader,
+        token_in=token_in,
+        permit2_address=permit2_address,
+        router_address=router_address,
+        amount_in=amount_in,
+        private_key=priv_key,
+        erc20_abi=erc20_abi,
+        permit2_abi=permit2_abi,
+    )
+
 
     amount_out_min = 0
     chain_ts = int(web3.eth.get_block("latest")["timestamp"])
@@ -252,9 +253,13 @@ def _build_swap_tx_universal_router(
     out["_demo_decimals_out"] = decimals_out
     out["_demo_router_mode"] = router_mode
     out["_demo_router"] = router_address
-    out["_demo_spender"] = permit2_address  # ERC20 approve 대상은 permit2
-    out["_demo_permit2"] = permit2_address  # 이미 있긴 한데 유지
+    out["_demo_spender"] = permit2_address  # ERC20 approve target is Permit2
+    out["_demo_permit2"] = permit2_address 
     out["_demo_gas_token_symbol"] = "BNB"
+    out["_demo_approve"] = approve_meta
+    out["_demo_approve_gas_cost_wei"] = int(approve_meta.get("approve_gas_cost_wei", 0) or 0)
+    out["_demo_approve_gas_cost_native"] = float(approve_meta.get("approve_gas_cost_native", 0.0) or 0.0)
+
 
     return out
 
@@ -363,21 +368,49 @@ def _rpc_ok(provider: Any, method: str, params: list) -> bool:
         return False
     return not (isinstance(resp, dict) and resp.get("error"))
 
-def _send_signed_and_wait(web3: Web3, tx: TxParams, private_key: str) -> None:
+def _send_signed_and_wait(web3: Web3, tx: TxParams, private_key: str) -> Dict[str, Any]:
     """
-    Send a locally-signed tx and ensure receipt.status == 1.
+    Send a locally-signed tx and return gas usage/cost metadata.
     """
     tx2: TxParams = dict(tx)
     tx2.setdefault("chainId", int(web3.eth.chain_id))
+
+    fallback_gas_price_wei = int(tx2.get("gasPrice", 0) or 0)
 
     signed = Account.sign_transaction(tx2, private_key)
     raw_tx = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
     tx_hash = web3.eth.send_raw_transaction(raw_tx)
     receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
 
+    # status
     status = int(receipt.get("status", 0)) if isinstance(receipt, dict) else int(getattr(receipt, "status", 0))
     if status != 1:
         raise RuntimeError(f"tx reverted: hash={tx_hash.hex()}")
+
+    # gasUsed / effectiveGasPrice
+    gas_used = int(receipt.get("gasUsed", 0)) if isinstance(receipt, dict) else int(getattr(receipt, "gasUsed", 0))
+    gas_price = int(receipt.get("effectiveGasPrice", 0)) if isinstance(receipt, dict) else int(
+        getattr(receipt, "effectiveGasPrice", 0)
+    )
+
+    if gas_price <= 0:
+        gas_price = int(fallback_gas_price_wei or 0)
+
+    if gas_price <= 0:
+        try:
+            gas_price = int(web3.eth.gas_price)
+        except Exception:
+            gas_price = 0
+
+    gas_cost_wei = int(gas_used) * int(gas_price)
+
+    return {
+        "tx_hash": tx_hash.hex(),
+        "gas_used": int(gas_used),
+        "gas_price_wei": int(gas_price),
+        "gas_cost_wei": int(gas_cost_wei),
+    }
+
 
 def _reverse_lookup_symbol_by_address(token_addr: str) -> Optional[str]:
     token_addr = Web3.to_checksum_address(token_addr)
@@ -538,17 +571,22 @@ def _ensure_allowance(
     private_key: str,
     erc20_abi: list,
     permit2_abi: list,
-) -> None:
+) -> Dict[str, Any]:
     """
     Ensure:
       1) ERC20 allowance(trader -> Permit2) >= amount_in
       2) Permit2 allowance(trader, token_in, router) is set and not expired
 
-    If Permit2 allowance is missing/expired, Universal Router swap reverts with:
-      Permit2.AllowanceExpired(uint256) selector 0xd81b2f2e
+    Returns approve gas metadata (sum across all approve txs).
     """
+    meta: Dict[str, Any] = {
+        "sent": False,
+        "tx_hashes": [],
+        "approve_gas_used": 0,
+        "approve_gas_cost_wei": 0,
+        "error": "",
+    }
 
-    # --- Normalize all addresses (this matters a lot) ---
     trader = Web3.to_checksum_address(trader)
     token_in = Web3.to_checksum_address(token_in)
     permit2_address = Web3.to_checksum_address(permit2_address)
@@ -560,7 +598,6 @@ def _ensure_allowance(
     gas_price_gwei = int(os.getenv("DEMO_PANCAKE_GAS_PRICE_GWEI", "3"))
     gas_price = web3.to_wei(gas_price_gwei, "gwei")
 
-    # Use pending nonce to be safe under forks
     def _nonce() -> int:
         try:
             return int(web3.eth.get_transaction_count(trader, "pending"))
@@ -569,37 +606,40 @@ def _ensure_allowance(
 
     max_uint256 = (1 << 256) - 1
     max_uint160 = (1 << 160) - 1
-    max_uint48 = (1 << 48) - 1  # uint48 max
+    max_uint48 = (1 << 48) - 1
 
     chain_ts = int(web3.eth.get_block("latest")["timestamp"])
-    desired_exp = max_uint48  # "never" style (works well on forks)
+    desired_exp = max_uint48
 
-    # -------- (A) ERC20 approve -> Permit2 --------
+    def _acc(tx_meta: Dict[str, Any]) -> None:
+        meta["sent"] = True
+        meta["tx_hashes"].append(str(tx_meta.get("tx_hash", "")))
+        meta["approve_gas_used"] += int(tx_meta.get("gas_used", 0) or 0)
+        meta["approve_gas_cost_wei"] += int(tx_meta.get("gas_cost_wei", 0) or 0)
+        meta["approve_gas_cost_native"] = float(meta["approve_gas_cost_wei"]) / 1e18
+
     try:
         allowance_to_permit2 = int(token_contract.functions.allowance(trader, permit2_address).call())
     except Exception:
         allowance_to_permit2 = 0
 
+    # (A) ERC20 approve -> Permit2
     if allowance_to_permit2 < amount_in:
-        # Some tokens require approve(0) first (USDT-like)
         if allowance_to_permit2 != 0:
             try:
                 tx0 = token_contract.functions.approve(permit2_address, 0).build_transaction(
                     {"from": trader, "gas": 200000, "gasPrice": gas_price, "nonce": _nonce()}
                 )
-                _send_signed_and_wait(web3, tx0, private_key)
+                _acc(_send_signed_and_wait(web3, tx0, private_key))
             except Exception:
                 pass
 
         tx1 = token_contract.functions.approve(permit2_address, max_uint256).build_transaction(
             {"from": trader, "gas": 200000, "gasPrice": gas_price, "nonce": _nonce()}
         )
-        _send_signed_and_wait(web3, tx1, private_key)
+        _acc(_send_signed_and_wait(web3, tx1, private_key))
 
-        # Re-check ERC20 allowance
-        allowance_to_permit2 = int(token_contract.functions.allowance(trader, permit2_address).call())
-
-    # -------- (B) Permit2 approve(token, spender=router, amount, expiration) --------
+    # (B) Permit2 approve(token, spender=router, amount, expiration)
     try:
         res = permit2.functions.allowance(trader, token_in, router_address).call()
         allowed_amount = int(res[0])
@@ -608,34 +648,11 @@ def _ensure_allowance(
         allowed_amount = 0
         expiration = 0
 
-    print(
-        "[permit2-before] "
-        f"token={token_in} router={router_address} "
-        f"allowed={allowed_amount} exp={expiration} now={chain_ts} "
-        f"amount_in={amount_in} erc20_allow_to_permit2={allowance_to_permit2}"
-    )
-
     need_permit2 = (allowed_amount < amount_in) or (expiration <= chain_ts)
-
     if need_permit2:
         tx2 = permit2.functions.approve(token_in, router_address, max_uint160, desired_exp).build_transaction(
             {"from": trader, "gas": 250000, "gasPrice": gas_price, "nonce": _nonce()}
         )
-        _send_signed_and_wait(web3, tx2, private_key)
+        _acc(_send_signed_and_wait(web3, tx2, private_key))
 
-        # Re-check and fail fast
-        res2 = permit2.functions.allowance(trader, token_in, router_address).call()
-        allowed2 = int(res2[0])
-        exp2 = int(res2[1])
-        now2 = int(web3.eth.get_block("latest")["timestamp"])
-
-        print(
-            "[permit2-after] "
-            f"token={token_in} router={router_address} "
-            f"allowed={allowed2} exp={exp2} now={now2} amount_in={amount_in}"
-        )
-
-        if allowed2 < amount_in or exp2 <= now2:
-            raise RuntimeError(
-                f"Permit2 allowance invalid after approve: allowed={allowed2} exp={exp2} now={now2} amount_in={amount_in}"
-            )
+    return meta

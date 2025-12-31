@@ -1217,6 +1217,49 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             except Exception:
                 return int(web3.eth.get_transaction_count(addr))
 
+        def _avg_num(xs: List[Any]) -> Optional[float]:
+            ys = [float(x) for x in xs if isinstance(x, (int, float))]
+            return (sum(ys) / len(ys)) if ys else None
+
+        def _sum_num(xs: List[Any]) -> Optional[float]:
+            ys = [float(x) for x in xs if isinstance(x, (int, float))]
+            return sum(ys) if ys else None
+
+        def _wei_to_native(wei: Any) -> float:
+            try:
+                return float(int(wei)) / 1e18
+            except Exception:
+                return 0.0
+
+        def _normalize_approve_meta(m: Any) -> Optional[Dict[str, Any]]:
+            if not isinstance(m, dict):
+                return None
+            out = dict(m)
+
+            # Normalize expected keys
+            out.setdefault("needed", 0)
+            out.setdefault("sent", False)
+            out.setdefault("approve_gas_used", 0)
+            out.setdefault("approve_gas_price_wei", 0)
+            out.setdefault("approve_gas_cost_wei", 0)
+            out.setdefault("tx_hashes", [])
+            out.setdefault("erc20", {})
+            out.setdefault("permit2", {})
+            out.setdefault("error", "")
+
+            # If builder provided nested metas only, derive totals.
+            if int(out.get("approve_gas_cost_wei") or 0) == 0:
+                erc20 = out.get("erc20") if isinstance(out.get("erc20"), dict) else {}
+                p2 = out.get("permit2") if isinstance(out.get("permit2"), dict) else {}
+                out["approve_gas_cost_wei"] = int(erc20.get("approve_gas_cost_wei", 0) or 0) + int(
+                    p2.get("permit2_gas_cost_wei", 0) or 0
+                )
+                out["approve_gas_used"] = int(erc20.get("approve_gas_used", 0) or 0) + int(
+                    p2.get("permit2_gas_used", 0) or 0
+                )
+
+            return out
+
         per_block_results: List[Dict[str, Any]] = []
 
         for offset in offsets:
@@ -1266,7 +1309,8 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                     )
                     continue
 
-            # Build swap tx (builder may include _demo_* fields)
+            # Build swap tx (builder may attach _demo_* metadata keys)
+            tx_dict = None
             try:
                 tx_dict = self._params.build_swap_tx(
                     web3=web3,
@@ -1286,54 +1330,85 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                     trader=trader,
                     private_key=priv_key if use_local_signing else None,
                 )
+            except Exception as exc:
+                per_block_results.append(
+                    {
+                        "fork_block": fork_block,
+                        "tx_hash": "",
+                        "status": 0,
+                        "gas_used": 0,
+                        "reset_method": used_reset_method,
+                        "impersonate_method": used_impersonate_method,
+                        "revert_reason": f"build_swap_tx_failed: {exc}",
+                    }
+                )
+                continue
 
-            # ---- Demo metadata keys (read from tx_dict BEFORE stripping) ----
+            if tx_dict is None:
+                per_block_results.append(
+                    {
+                        "fork_block": fork_block,
+                        "tx_hash": "",
+                        "status": 0,
+                        "gas_used": 0,
+                        "reset_method": used_reset_method,
+                        "impersonate_method": used_impersonate_method,
+                        "revert_reason": "build_swap_tx_returned_none",
+                    }
+                )
+                continue
+
+            if not isinstance(tx_dict, dict):
+                try:
+                    tx_dict = dict(tx_dict)
+                except Exception as exc:
+                    per_block_results.append(
+                        {
+                            "fork_block": fork_block,
+                            "tx_hash": "",
+                            "status": 0,
+                            "gas_used": 0,
+                            "reset_method": used_reset_method,
+                            "impersonate_method": used_impersonate_method,
+                            "revert_reason": f"build_swap_tx_non_dict: type={type(tx_dict)} err={exc}",
+                        }
+                    )
+                    continue
+
+
+            # Demo metadata keys from builder
             token_in = tx_dict.get("_demo_token_in")
             token_out = tx_dict.get("_demo_token_out")
             amount_in_wei = tx_dict.get("_demo_amount_in_wei")
 
+            # Gas token symbol (native only; no quote conversion)
+            gas_token_symbol = tx_dict.get("_demo_gas_token_symbol") or self._params.native_symbol or "BNB"
+
             permit2_addr = tx_dict.get("_demo_permit2") or tx_dict.get("_demo_spender")
-            router_mode = tx_dict.get("_demo_router_mode")
+            router_addr = tx_dict.get("to")
 
-            native_price_in_quote = tx_dict.get("_demo_native_price_in_quote")
-            gas_token_symbol = tx_dict.get("_demo_gas_token_symbol")
-
-            # Strip non-tx fields: only allow recognized tx keys
+            # Strip builder metadata before sending/signing
             ALLOWED_TX_KEYS = {
                 "from", "to", "value", "data", "nonce",
                 "gas", "gasPrice", "maxFeePerGas", "maxPriorityFeePerGas",
                 "chainId", "type", "accessList",
             }
-            tx_send: Dict[str, Any] = {k: v for k, v in tx_dict.items() if k in ALLOWED_TX_KEYS}
-
-            # Normalize required fields
+            tx_send = {k: v for k, v in tx_dict.items() if k in ALLOWED_TX_KEYS}
             tx_send["from"] = trader
             tx_send.setdefault("chainId", int(web3.eth.chain_id))
 
-            if not tx_send.get("to"):
-                raise RuntimeError("swap tx missing 'to' field (router address)")
-
-            # Estimate gas on clean tx
             if "gas" not in tx_send:
                 try:
                     est = int(web3.eth.estimate_gas(tx_send))
                     tx_send["gas"] = int(est * 12 // 10)
                 except Exception:
                     tx_send["gas"] = 600_000
-            else:
-                try:
-                    tx_send["gas"] = int(tx_send["gas"])
-                except Exception:
-                    pass
 
             if "gasPrice" not in tx_send and "maxFeePerGas" not in tx_send:
                 try:
                     tx_send["gasPrice"] = int(web3.eth.gas_price)
                 except Exception:
                     pass
-
-            # Use router address from clean tx for permit2 spender
-            router_addr = str(tx_send.get("to") or tx_dict.get("to"))
 
             token_in_contract = None
             token_out_contract = None
@@ -1392,64 +1467,70 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                 except Exception:
                     pass
 
-            # Ensure allowance (approve tx), collect approve gas cost
+            # Ensure allowance (approve tx) and collect approve gas
             permit2_addr = tx_dict.get("_demo_permit2", None) or tx_dict.get("_demo_spender", None)
+            router_addr = tx_dict.get("to")
 
-            allowance_meta: Dict[str, Any] = {
-                "needed": int(amount_in_wei or 0),
-                "sent": False,
-                "approve_gas_used": 0,
-                "approve_gas_price_wei": 0,
-                "approve_gas_cost_wei": 0,
-                "tx_hashes": [],
-                "erc20": {},
-                "permit2": {},
-                "error": "",
-            }
+            allowance_meta = _normalize_approve_meta(tx_dict.get("_demo_approve"))
 
-            try:
-                if token_in and amount_in_wei is not None and permit2_addr and router_addr and token_in_contract is not None:
-                    # (1) ERC20 approve to Permit2
-                    erc20_meta = self._ensure_allowance(
-                        web3=web3,
-                        owner=trader,
-                        token=token_in,
-                        spender=str(permit2_addr),
-                        amount_wei=int(amount_in_wei),
-                        priv_key=priv_key,
-                        use_local_signing=use_local_signing,
-                    )
+            if allowance_meta is None:
+                allowance_meta = {
+                    "needed": int(amount_in_wei or 0),
+                    "sent": False,
+                    "approve_gas_used": 0,
+                    "approve_gas_price_wei": 0,
+                    "approve_gas_cost_wei": 0,
+                    "tx_hashes": [],
+                    "erc20": {},
+                    "permit2": {},
+                    "error": "",
+                }
 
-                    # (2) Permit2 approve to Router (spender=router)
-                    permit2_meta = self._ensure_permit2_allowance(
-                        web3=web3,
-                        owner=trader,
-                        permit2=str(permit2_addr),
-                        token=str(token_in),
-                        spender=str(router_addr),
-                        amount_wei=int(amount_in_wei),
-                        priv_key=priv_key,
-                        use_local_signing=use_local_signing,
-                    )
+                try:
+                    if token_in and amount_in_wei is not None and permit2_addr and router_addr and token_in_contract is not None:
+                        # (1) ERC20 approve token_in -> Permit2
+                        erc20_meta = self._ensure_allowance(
+                            web3=web3,
+                            owner=trader,
+                            token=token_in,
+                            spender=str(permit2_addr),
+                            amount_wei=int(amount_in_wei),
+                            priv_key=priv_key,
+                            use_local_signing=use_local_signing,
+                        )
 
-                    allowance_meta["erc20"] = erc20_meta
-                    allowance_meta["permit2"] = permit2_meta
+                        # (2) Permit2 approve (owner, token_in, router) allowance
+                        permit2_meta = self._ensure_permit2_allowance(
+                            web3=web3,
+                            owner=trader,
+                            permit2=str(permit2_addr),
+                            token=str(token_in),
+                            spender=str(router_addr),
+                            amount_wei=int(amount_in_wei),
+                            priv_key=priv_key,
+                            use_local_signing=use_local_signing,
+                        )
 
-                    erc20_cost = int(erc20_meta.get("approve_gas_cost_wei", 0) or 0)
-                    erc20_used = int(erc20_meta.get("approve_gas_used", 0) or 0)
-                    permit2_cost = int(permit2_meta.get("permit2_gas_cost_wei", 0) or 0)
-                    permit2_used = int(permit2_meta.get("permit2_gas_used", 0) or 0)
+                        allowance_meta["erc20"] = erc20_meta
+                        allowance_meta["permit2"] = permit2_meta
 
-                    allowance_meta["approve_gas_cost_wei"] = erc20_cost + permit2_cost
-                    allowance_meta["approve_gas_used"] = erc20_used + permit2_used
-                    allowance_meta["sent"] = bool(erc20_meta.get("sent")) or bool(permit2_meta.get("sent"))
-                    allowance_meta["tx_hashes"] = list(erc20_meta.get("tx_hashes", []) or []) + list(
-                        permit2_meta.get("tx_hashes", []) or []
-                    )
+                        erc20_cost = int((erc20_meta or {}).get("approve_gas_cost_wei", 0) or 0)
+                        erc20_used = int((erc20_meta or {}).get("approve_gas_used", 0) or 0)
 
-            except Exception as exc:
-                allowance_meta["error"] = f"ensure_allowance_failed: {exc}"
-                logger.warning("[pancake-demo] ensure_allowance failed: %s", exc)
+                        p2_cost = int((permit2_meta or {}).get("permit2_gas_cost_wei", 0) or 0)
+                        p2_used = int((permit2_meta or {}).get("permit2_gas_used", 0) or 0)
+
+                        allowance_meta["approve_gas_cost_wei"] = erc20_cost + p2_cost
+                        allowance_meta["approve_gas_used"] = erc20_used + p2_used
+                        allowance_meta["sent"] = bool((erc20_meta or {}).get("sent")) or bool((permit2_meta or {}).get("sent"))
+
+                        allowance_meta["tx_hashes"] = list((erc20_meta or {}).get("tx_hashes", []) or []) + list(
+                            (permit2_meta or {}).get("tx_hashes", []) or []
+                        )
+                except Exception as exc:
+                    allowance_meta["error"] = f"ensure_allowance_failed: {exc}"
+                    logger.warning("[pancake-demo] ensure_allowance failed: %s", exc)
+
 
             tx_hash_hex = ""
             status = 0
@@ -1511,7 +1592,7 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
             fill_price = None
             return_vs_hint = None
 
-            # Derive base/quote qty from balance deltas
+            # Derive base/quote qty from balance deltas (only on success)
             if (
                 status == 1
                 and token_in_contract is not None
@@ -1531,8 +1612,9 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                     scale_in = 10 ** int(decimals_in)
                     scale_out = 10 ** int(decimals_out)
 
-                    # BUY: token_in=quote(spent), token_out=base(received)
-                    # SELL: token_in=base(spent),  token_out=quote(received)
+                    # Mapping:
+                    # - BUY  : token_in = quote(spent), token_out = base(received)
+                    # - SELL : token_in = base(spent),  token_out = quote(received)
                     if side == OrderSide.BUY:
                         quote_qty = (-delta_in) / scale_in
                         base_qty = (delta_out) / scale_out
@@ -1552,56 +1634,55 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                     fill_price = None
                     return_vs_hint = None
 
-            expected_notional_quote = None
-            pnl_quote_vs_hint = None
-            pnl_rate_vs_hint = None
 
-            extra_fee_quote = None
-            net_pnl_quote_excl_gas = None
-            net_return_vs_hint_excl_gas = None
+            expected_notional_quote: Optional[float] = None
+            pnl_quote_vs_hint: Optional[float] = None
+            pnl_rate_vs_hint: Optional[float] = None
 
-            net_pnl_quote_incl_swap_gas = None
-            net_return_vs_hint_incl_swap_gas = None
+            extra_fee_quote: Optional[float] = None
 
-            net_pnl_quote_incl_gas = None
-            net_return_vs_hint_incl_gas = None
+            net_pnl_quote_excl_gas: Optional[float] = None
+            net_return_excl_gas: Optional[float] = None
 
+            net_pnl_quote_incl_swap_gas: Optional[float] = None
+            net_return_incl_swap_gas: Optional[float] = None
+
+            net_pnl_quote_incl_total_gas: Optional[float] = None
+            net_return_incl_total_gas: Optional[float] = None
+
+            # Gas cost (native)
             approve_cost_wei = int(allowance_meta.get("approve_gas_cost_wei", 0) or 0)
-            swap_cost_wei = int(swap_gas_cost_wei)
+            swap_cost_wei = int(swap_gas_cost_wei or 0)
 
-            approve_cost_native = float(approve_cost_wei) / 1e18 if approve_cost_wei > 0 else 0.0
-            swap_cost_native = float(swap_cost_wei) / 1e18 if swap_cost_wei > 0 else 0.0
+            approve_gas_cost_native = float(approve_cost_wei) / 1e18 if approve_cost_wei > 0 else 0.0
+            swap_gas_cost_native = float(swap_cost_wei) / 1e18 if swap_cost_wei > 0 else 0.0
 
             gas_total_cost_wei = approve_cost_wei + swap_cost_wei
-            gas_cost_native = float(gas_total_cost_wei) / 1e18 if gas_total_cost_wei > 0 else 0.0
+            total_gas_cost_native = float(gas_total_cost_wei) / 1e18 if gas_total_cost_wei > 0 else 0.0
 
+            approve_cost_native = approve_gas_cost_native
+            swap_cost_native = swap_gas_cost_native
+            gas_cost_native = total_gas_cost_native
+            # Native gas symbol only (no implicit quote conversion)
             gas_sym = (str(gas_token_symbol or self._params.native_symbol or "BNB")).strip() or "BNB"
-            native_px = None
-            try:
-                if isinstance(native_price_in_quote, (int, float)) and float(native_price_in_quote) > 0:
-                    native_px = float(native_price_in_quote)
-                elif isinstance(self._params.native_price_in_quote, (int, float)) and float(self._params.native_price_in_quote) > 0:
-                    native_px = float(self._params.native_price_in_quote)
-            except Exception:
-                native_px = None
 
-            quote_asset_guess = None
-            try:
-                clean_symbol = symbol[5:] if (symbol or "").upper().startswith("DEMO_") else symbol
-                _, quote_asset_guess = resolve_base_quote(clean_symbol)
-            except Exception:
-                quote_asset_guess = None
+            # Optional: convert gas(native) -> quote when a price is provided.
+            # If you want "native-only" strictly, keep native_price_in_quote=None.
+            approve_cost_quote: Optional[float] = None
+            swap_cost_quote: Optional[float] = None
+            gas_cost_quote: Optional[float] = None
 
-            if native_px is None and quote_asset_guess and quote_asset_guess.upper() == gas_sym.upper():
-                native_px = 1.0
+            native_px = getattr(self._params, "native_price_in_quote", None)
+            if isinstance(native_px, (int, float)) and float(native_px) > 0:
+                approve_cost_quote = float(approve_cost_native) * float(native_px)
+                swap_cost_quote = float(swap_cost_native) * float(native_px)
+                gas_cost_quote = float(gas_cost_native) * float(native_px)
 
-            approve_cost_quote = (approve_cost_native * native_px) if (native_px is not None) else None
-            swap_cost_quote = (swap_cost_native * native_px) if (native_px is not None) else None
-            gas_cost_quote = (gas_cost_native * native_px) if (native_px is not None) else None
-
+            # Compute PnL/returns if we have fill quantities
             if base_qty is not None and quote_qty is not None and price > 0 and base_qty > 0:
                 expected_notional_quote = float(base_qty) * float(price)
 
+                # PnL vs hint in quote units
                 if side == OrderSide.BUY:
                     pnl_quote_vs_hint = expected_notional_quote - float(quote_qty)
                 else:
@@ -1610,37 +1691,52 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                 if expected_notional_quote > 0:
                     pnl_rate_vs_hint = float(pnl_quote_vs_hint) / float(expected_notional_quote)
 
+                # Extra fee (NOT DEX LP fee): applied on quote amount
                 extra_fee_quote = abs(float(quote_qty)) * float(fee_rate)
 
                 net_pnl_quote_excl_gas = float(pnl_quote_vs_hint) - float(extra_fee_quote)
                 if expected_notional_quote > 0:
-                    net_return_vs_hint_excl_gas = float(net_pnl_quote_excl_gas) / float(expected_notional_quote)
+                    net_return_excl_gas = float(net_pnl_quote_excl_gas) / float(expected_notional_quote)
 
+                # Include gas only if we can convert native -> quote
                 if swap_cost_quote is not None:
                     net_pnl_quote_incl_swap_gas = float(net_pnl_quote_excl_gas) - float(swap_cost_quote)
                     if expected_notional_quote > 0:
-                        net_return_vs_hint_incl_swap_gas = float(net_pnl_quote_incl_swap_gas) / float(expected_notional_quote)
+                        net_return_incl_swap_gas = float(net_pnl_quote_incl_swap_gas) / float(expected_notional_quote)
 
                 if gas_cost_quote is not None:
-                    net_pnl_quote_incl_gas = float(net_pnl_quote_excl_gas) - float(gas_cost_quote)
+                    net_pnl_quote_incl_total_gas = float(net_pnl_quote_excl_gas) - float(gas_cost_quote)
                     if expected_notional_quote > 0:
-                        net_return_vs_hint_incl_gas = float(net_pnl_quote_incl_gas) / float(expected_notional_quote)
+                        net_return_incl_total_gas = float(net_pnl_quote_incl_total_gas) / float(expected_notional_quote)
 
+            # Backward-compatible: prefer "incl swap gas" if available, else "excl gas"
             net_return_vs_hint = (
-                net_return_vs_hint_incl_swap_gas
-                if net_return_vs_hint_incl_swap_gas is not None
-                else net_return_vs_hint_excl_gas
+                net_return_incl_swap_gas
+                if net_return_incl_swap_gas is not None
+                else net_return_excl_gas
             )
 
+            # Aliases used later when building `result`
+            swap_pnl_quote = pnl_quote_vs_hint
+            swap_pnl_rate = pnl_rate_vs_hint
+
+            net_pnl_excl_gas = net_pnl_quote_excl_gas
+            net_ret_excl_gas = net_return_excl_gas
+
+            net_pnl_incl_swap_gas = net_pnl_quote_incl_swap_gas
+            net_ret_incl_swap_gas = net_return_incl_swap_gas
+
+            net_pnl_incl_total_gas = net_pnl_quote_incl_total_gas
+            net_ret_incl_total_gas = net_return_incl_total_gas
+
+            # swap_prepare log (pre-send info)
             to_addr = tx_send.get("to")
             data = tx_send.get("data", b"")
-            try:
-                data_len = len(data) if isinstance(data, (bytes, bytearray)) else len(str(data))
-            except Exception:
-                data_len = 0
+            data_len = len(data) if isinstance(data, (bytes, bytearray)) else len(str(data))
 
             logger.info(
-                "[pancake-demo] swap_prepare symbol=%s side=%s qty=%.8f hint=%.6f fork_block=%s reset=%s imp=%s from=%s to=%s value=%s gas=%s gasPrice=%s nonce=%s data_len=%s",
+                "[pancake-demo] swap_prepare symbol=%s side=%s qty=%.8f hint=%.6f fork_block=%s reset=%s imp=%s "
+                "from=%s to=%s value=%s gas=%s gasPrice=%s nonce=%s data_len=%s",
                 symbol,
                 side.value,
                 float(quantity),
@@ -1657,6 +1753,41 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                 data_len,
             )
 
+            # Per-block metrics log
+            logger.info(
+                "[pancake-demo] swap_metrics fork_block=%s status=%s tx=%s side=%s qty=%.8f "
+                "hint=%.6f fill=%s slip_bps=%s "
+                "swap_pnl_quote=%s swap_pnl_rate=%s "
+                "fee_rate=%.8f fee_quote=%s "
+                "approve_gas_native=%s swap_gas_native=%s total_gas_native=%s "
+                "approve_gas_quote=%s swap_gas_quote=%s total_gas_quote=%s "
+                "net_excl_gas=%s net_incl_swap_gas=%s net_incl_total_gas=%s revert=%s",
+                fork_block,
+                status,
+                (tx_hash_hex[:10] if tx_hash_hex else ""),
+                side.value,
+                float(quantity),
+                float(price),
+                (f"{fill_price:.10f}" if isinstance(fill_price, (int, float)) else None),
+                (f"{(return_vs_hint * 10000.0):.3f}" if return_vs_hint is not None else None),
+                (f"{swap_pnl_quote:.10f}" if isinstance(swap_pnl_quote, (int, float)) else None),
+                (f"{(swap_pnl_rate * 100.0):.6f}%" if swap_pnl_rate is not None else None),
+                float(fee_rate),
+                (f"{extra_fee_quote:.10f}" if isinstance(extra_fee_quote, (int, float)) else None),
+                (f"{approve_cost_native:.10f}" if isinstance(approve_cost_native, (int, float)) else None),
+                (f"{swap_cost_native:.10f}" if isinstance(swap_cost_native, (int, float)) else None),
+                (f"{gas_cost_native:.10f}" if isinstance(gas_cost_native, (int, float)) else None),
+                (f"{approve_cost_quote:.10f}" if isinstance(approve_cost_quote, (int, float)) else None),
+                (f"{swap_cost_quote:.10f}" if isinstance(swap_cost_quote, (int, float)) else None),
+                (f"{gas_cost_quote:.10f}" if isinstance(gas_cost_quote, (int, float)) else None),
+                (f"{(net_ret_excl_gas * 100.0):.6f}%" if net_ret_excl_gas is not None else None),
+                (f"{(net_ret_incl_swap_gas * 100.0):.6f}%" if net_ret_incl_swap_gas is not None else None),
+                (f"{(net_ret_incl_total_gas * 100.0):.6f}%" if net_ret_incl_total_gas is not None else None),
+                revert_reason,
+            )
+
+
+            approve_gas_cost_wei = int(approve_cost_wei)
             result: Dict[str, Any] = {
                 "fork_block": fork_block,
                 "tx_hash": tx_hash_hex,
@@ -1668,14 +1799,20 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
                 "swap_gas_used": int(swap_gas_used),
                 "swap_gas_price_wei": int(swap_gas_price_wei),
                 "swap_gas_cost_wei": int(swap_gas_cost_wei),
-                "approve_gas_cost_wei": int(approve_cost_wei),
-                "approve_gas_cost_quote": approve_cost_quote,
-                "swap_gas_cost_quote": swap_cost_quote,
+
+                "approve_gas_cost_wei": int(approve_gas_cost_wei),
+                "swap_gas_cost_native": float(swap_gas_cost_native),
+                "total_gas_cost_native": float(total_gas_cost_native),
                 "total_gas_cost_wei": int(gas_total_cost_wei),
-                "gas_cost_native": float(gas_cost_native),
+
+                # Gas costs in native token (always available if receipts exist)
+                "approve_gas_cost_native": float(approve_cost_native),
+                "swap_gas_cost_native": float(swap_cost_native),
+                "total_gas_cost_native": float(gas_cost_native),
+
+        
                 "gas_token_symbol": gas_sym,
-                "native_price_in_quote": native_px,
-                "gas_cost_quote": gas_cost_quote,
+
                 "extra_fee_rate": float(fee_rate),
             }
 
@@ -1701,87 +1838,116 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
 
             if expected_notional_quote is not None:
                 result["expected_notional_quote"] = float(expected_notional_quote)
-            if pnl_quote_vs_hint is not None:
-                result["pnl_quote_vs_hint"] = float(pnl_quote_vs_hint)
-            if pnl_rate_vs_hint is not None:
-                result["pnl_rate_vs_hint"] = float(pnl_rate_vs_hint)
 
-            if extra_fee_quote is not None:
-                result["extra_fee_quote"] = float(extra_fee_quote)
+            result["swap_pnl_quote_vs_hint"] = swap_pnl_quote
+            result["swap_pnl_rate_vs_hint"] = swap_pnl_rate
+            result["fee_quote"] = extra_fee_quote
 
-            if net_pnl_quote_excl_gas is not None:
-                result["net_pnl_quote_excl_gas"] = float(net_pnl_quote_excl_gas)
-            if net_return_vs_hint_excl_gas is not None:
-                result["net_return_vs_hint_excl_gas"] = float(net_return_vs_hint_excl_gas)
+            result["net_pnl_quote_excl_gas"] = net_pnl_excl_gas
+            result["net_return_excl_gas"] = net_ret_excl_gas
 
-            if net_pnl_quote_incl_gas is not None:
-                result["net_pnl_quote_incl_gas"] = float(net_pnl_quote_incl_gas)
-            if net_return_vs_hint_incl_gas is not None:
-                result["net_return_vs_hint_incl_gas"] = float(net_return_vs_hint_incl_gas)
+            result["net_pnl_quote_incl_swap_gas"] = net_pnl_incl_swap_gas
+            result["net_return_incl_swap_gas"] = net_ret_incl_swap_gas
 
+            result["net_pnl_quote_incl_total_gas"] = net_pnl_incl_total_gas
+            result["net_return_incl_total_gas"] = net_ret_incl_total_gas
+
+            # Backward compatible "final" net return
             if net_return_vs_hint is not None:
                 result["net_return_vs_hint"] = float(net_return_vs_hint)
 
             per_block_results.append(result)
 
-        account = self._state.get_or_create_account(self.name, self.instrument)
+            account = self._state.get_or_create_account(self.name, self.instrument)
 
-        demo_meta: Dict[str, Any] = {
-            "base_block": base_block,
-            "block_offsets": list(offsets),
-            "per_block_results": per_block_results,
-            "account_snapshot": {"balances": dict(account.balances)},
-        }
+            demo_meta: Dict[str, Any] = {
+                "base_block": base_block,
+                "block_offsets": list(offsets),
+                "per_block_results": per_block_results,
+                "account_snapshot": {"balances": dict(account.balances)},
+            }
 
-        ok_rows = [r for r in per_block_results if int(r.get("status", 0) or 0) == 1]
-        ok_count = len(ok_rows)
-        fail_count = len(per_block_results) - ok_count
+            ok_rows = [r for r in per_block_results if int(r.get("status", 0) or 0) == 1]
+            ok_count = len(ok_rows)
+            fail_count = len(per_block_results) - ok_count
 
-        demo_meta["all_ok"] = (ok_count == len(per_block_results))
-        demo_meta["ok_count"] = ok_count
-        demo_meta["fail_count"] = fail_count
+            demo_meta["all_ok"] = (ok_count == len(per_block_results))
+            demo_meta["ok_count"] = ok_count
+            demo_meta["fail_count"] = fail_count
 
-        ok_fill_prices = [float(r["fill_price"]) for r in ok_rows if isinstance(r.get("fill_price"), (int, float))]
-        demo_meta["avg_fill_price"] = (sum(ok_fill_prices) / len(ok_fill_prices)) if ok_fill_prices else None
+            # Avg fill price across success
+            ok_fill_prices = [
+                float(r.get("fill_price"))
+                for r in ok_rows
+                if isinstance(r.get("fill_price"), (int, float))
+            ]
+            demo_meta["avg_fill_price"] = (sum(ok_fill_prices) / len(ok_fill_prices)) if ok_fill_prices else None
 
-        ok_returns = [
-            float(r["return_vs_hint"])
-            for r in ok_rows
-            if int(r.get("status", 0) or 0) == 1 and isinstance(r.get("return_vs_hint"), (int, float))
-        ]
-        demo_meta["avg_return_vs_hint"] = (sum(ok_returns) / len(ok_returns)) if ok_returns else None
+            # Slippage vs hint (NOT net)
+            ok_returns = [
+                float(r.get("return_vs_hint"))
+                for r in ok_rows
+                if isinstance(r.get("return_vs_hint"), (int, float))
+            ]
+            demo_meta["avg_return_vs_hint"] = (sum(ok_returns) / len(ok_returns)) if ok_returns else None
 
-        ok_base_qtys = [float(r["base_qty"]) for r in ok_rows if isinstance(r.get("base_qty"), (int, float))]
-        ok_quote_qtys = [float(r["quote_qty"]) for r in ok_rows if isinstance(r.get("quote_qty"), (int, float))]
-        demo_meta["avg_base_qty"] = (sum(ok_base_qtys) / len(ok_base_qtys)) if ok_base_qtys else None
-        demo_meta["avg_quote_qty"] = (sum(ok_quote_qtys) / len(ok_quote_qtys)) if ok_quote_qtys else None
+            # Avg base/quote qty
+            ok_base_qtys = [
+                float(r.get("base_qty"))
+                for r in ok_rows
+                if isinstance(r.get("base_qty"), (int, float))
+            ]
+            ok_quote_qtys = [
+                float(r.get("quote_qty"))
+                for r in ok_rows
+                if isinstance(r.get("quote_qty"), (int, float))
+            ]
+            demo_meta["avg_base_qty"] = (sum(ok_base_qtys) / len(ok_base_qtys)) if ok_base_qtys else None
+            demo_meta["avg_quote_qty"] = (sum(ok_quote_qtys) / len(ok_quote_qtys)) if ok_quote_qtys else None
 
-        ok_net_returns = [
-            float(r["net_return_vs_hint"])
-            for r in ok_rows
-            if isinstance(r.get("net_return_vs_hint"), (int, float))
-        ]
-        demo_meta["avg_net_return_vs_hint"] = (sum(ok_net_returns) / len(ok_net_returns)) if ok_net_returns else None
+            # Optional: net return (keep if you use it elsewhere)
+            ok_net_returns = [
+                float(r.get("net_return_vs_hint"))
+                for r in ok_rows
+                if isinstance(r.get("net_return_vs_hint"), (int, float))
+            ]
+            demo_meta["avg_net_return_vs_hint"] = (sum(ok_net_returns) / len(ok_net_returns)) if ok_net_returns else None
 
-        ok_net_incl = [
-            float(r["net_return_vs_hint_incl_gas"])
-            for r in ok_rows
-            if isinstance(r.get("net_return_vs_hint_incl_gas"), (int, float))
-        ]
-        demo_meta["avg_net_return_vs_hint_incl_gas"] = (sum(ok_net_incl) / len(ok_net_incl)) if ok_net_incl else None
+            demo_meta["avg_swap_pnl_rate_vs_hint"] = _avg_num([r.get("swap_pnl_rate_vs_hint") for r in ok_rows])
+            demo_meta["avg_fee_quote"] = _avg_num([r.get("fee_quote") for r in ok_rows])
 
-        ok_net_excl = [
-            float(r["net_return_vs_hint_excl_gas"])
-            for r in ok_rows
-            if isinstance(r.get("net_return_vs_hint_excl_gas"), (int, float))
-        ]
-        demo_meta["avg_net_return_vs_hint_excl_gas"] = (sum(ok_net_excl) / len(ok_net_excl)) if ok_net_excl else None
+            # Native gas metrics (approve/swap/total)
+            demo_meta["avg_approve_gas_cost_native"] = _avg_num([r.get("approve_gas_cost_native") for r in ok_rows])
+            demo_meta["avg_swap_gas_cost_native"] = _avg_num([r.get("swap_gas_cost_native") for r in ok_rows])
+            demo_meta["avg_total_gas_cost_native"] = _avg_num([r.get("total_gas_cost_native") for r in ok_rows])
 
-        ok_gas_native = [float(r["gas_cost_native"]) for r in ok_rows if isinstance(r.get("gas_cost_native"), (int, float))]
-        demo_meta["avg_gas_cost_native"] = (sum(ok_gas_native) / len(ok_gas_native)) if ok_gas_native else None
+            demo_meta["sum_approve_gas_cost_native"] = _sum_num([r.get("approve_gas_cost_native") for r in ok_rows])
+            demo_meta["sum_swap_gas_cost_native"] = _sum_num([r.get("swap_gas_cost_native") for r in ok_rows])
+            demo_meta["sum_total_gas_cost_native"] = _sum_num([r.get("total_gas_cost_native") for r in ok_rows])
 
-        ok_gas_quote = [float(r["gas_cost_quote"]) for r in ok_rows if isinstance(r.get("gas_cost_quote"), (int, float))]
-        demo_meta["avg_gas_cost_quote"] = (sum(ok_gas_quote) / len(ok_gas_quote)) if ok_gas_quote else None
+            # Backward-compatible aliases (create_order가 avg_gas_cost_native를 읽는 구조면 필수)
+            demo_meta["avg_gas_cost_native"] = demo_meta["avg_total_gas_cost_native"]
+            demo_meta["sum_gas_cost_native"] = demo_meta["sum_total_gas_cost_native"]
+
+            # LEG summary log (native only)
+            logger.info(
+                "[pancake-demo][LEG] symbol=%s side=%s ok=%s fail=%s avg_fill=%s "
+                "avg_slip_bps=%s gas_sym=%s "
+                "approve_gas_native(avg=%s sum=%s) swap_gas_native(avg=%s sum=%s) total_gas_native(avg=%s sum=%s)",
+                symbol,
+                side.value,
+                ok_count,
+                fail_count,
+                (f"{demo_meta.get('avg_fill_price'):.10f}" if isinstance(demo_meta.get("avg_fill_price"), (int, float)) else None),
+                (f"{(demo_meta.get('avg_return_vs_hint') * 10000.0):.3f}" if isinstance(demo_meta.get("avg_return_vs_hint"), (int, float)) else None),
+                (self._params.native_symbol or "BNB"),
+                (f"{demo_meta.get('avg_approve_gas_cost_native'):.10f}" if isinstance(demo_meta.get("avg_approve_gas_cost_native"), (int, float)) else None),
+                (f"{demo_meta.get('sum_approve_gas_cost_native'):.10f}" if isinstance(demo_meta.get("sum_approve_gas_cost_native"), (int, float)) else None),
+                (f"{demo_meta.get('avg_swap_gas_cost_native'):.10f}" if isinstance(demo_meta.get("avg_swap_gas_cost_native"), (int, float)) else None),
+                (f"{demo_meta.get('sum_swap_gas_cost_native'):.10f}" if isinstance(demo_meta.get("sum_swap_gas_cost_native"), (int, float)) else None),
+                (f"{demo_meta.get('avg_total_gas_cost_native'):.10f}" if isinstance(demo_meta.get("avg_total_gas_cost_native"), (int, float)) else None),
+                (f"{demo_meta.get('sum_total_gas_cost_native'):.10f}" if isinstance(demo_meta.get("sum_total_gas_cost_native"), (int, float)) else None),
+            )
 
         return demo_meta
 
@@ -1905,28 +2071,57 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         return int(getattr(receipt, key, default) or default)
 
     def _gas_cost_from_receipt(
-        self,
-        web3: Web3,
-        receipt: Any,
-        fallback_gas_price_wei: int = 0,
+        self, 
+        web3: Web3, 
+        receipt: Any, 
+        fallback_gas_price_wei: int = 0
     ) -> Tuple[int, int, int]:
-        """
-        Return (gas_used, gas_price_wei, gas_cost_wei).
-        Prefer effectiveGasPrice if available, else fallback to provided gas price or node gas_price.
-        """
-        gas_used = self._receipt_int(receipt, "gasUsed", 0)
-        gas_price_wei = self._receipt_int(receipt, "effectiveGasPrice", 0)
+        gas_used = int(receipt.get("gasUsed", 0)) if isinstance(receipt, dict) else int(getattr(receipt, "gasUsed", 0))
+        gas_price = int(receipt.get("effectiveGasPrice", 0)) if isinstance(receipt, dict) else int(getattr(receipt, "effectiveGasPrice", 0))
 
-        if gas_price_wei <= 0:
-            gas_price_wei = int(fallback_gas_price_wei or 0)
+        if gas_price <= 0:
+            gas_price = int(fallback_gas_price_wei or 0)
 
-        if gas_price_wei <= 0:
+        if gas_price <= 0:
             try:
-                gas_price_wei = int(web3.eth.gas_price)
+                gas_price = int(web3.eth.gas_price)
             except Exception:
-                gas_price_wei = 0
+                gas_price = 0
 
-        return gas_used, gas_price_wei, gas_used * gas_price_wei
+        return gas_used, gas_price, gas_used * gas_price
+
+
+    def _send_signed_and_wait(
+        self, 
+        web3: Web3, 
+        tx, 
+        private_key: str
+    ) -> Dict[str, Any]:
+        """
+        Send a locally-signed tx and return gas usage/cost metadata.
+        """
+        tx2 = dict(tx)
+        tx2.setdefault("chainId", int(web3.eth.chain_id))
+
+        fallback_gas_price_wei = int(tx2.get("gasPrice", 0) or 0)
+
+        signed = Account.sign_transaction(tx2, private_key)
+        raw_tx = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
+        tx_hash = web3.eth.send_raw_transaction(raw_tx)
+        receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
+
+        status = int(receipt.get("status", 0)) if isinstance(receipt, dict) else int(getattr(receipt, "status", 0))
+        if status != 1:
+            raise RuntimeError(f"tx reverted: hash={tx_hash.hex()}")
+
+        gas_used, gas_price_wei, gas_cost_wei = self._gas_cost_from_receipt(web3, receipt, fallback_gas_price_wei=fallback_gas_price_wei)
+
+        return {
+            "tx_hash": tx_hash.hex(),
+            "gas_used": int(gas_used),
+            "gas_price_wei": int(gas_price_wei),
+            "gas_cost_wei": int(gas_cost_wei),
+        }
 
     def _ensure_allowance(
         self,
@@ -1944,12 +2139,12 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         Returns metadata including approve gas usage/cost.
         """
         meta: Dict[str, Any] = {
-            "needed": int(amount_wei or 0),
             "sent": False,
-            "approve_gas_used": 0,
-            "approve_gas_price_wei": 0,
-            "approve_gas_cost_wei": 0,
             "tx_hashes": [],
+            "approve_gas_used": 0,
+            "approve_gas_cost_wei": 0,
+            "approve_gas_cost_native": 0.0, 
+            "gas_token_symbol": "BNB",  
             "error": "",
         }
 
