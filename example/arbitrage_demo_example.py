@@ -147,7 +147,7 @@ async def main() -> None:
         account_address="",
         build_swap_tx=build_swap_tx_router_v3,
         private_key=private_key,
-        block_offsets=(1, 2, 3),
+        block_offsets=(1,),
         default_fee_rate=float(os.getenv("DEMO_PANCAKE_DEFAULT_FEE_RATE", "0.0005")),
     )
 
@@ -157,7 +157,7 @@ async def main() -> None:
         account_address="",
         build_swap_tx=build_swap_tx_router_v2,
         private_key=private_key,
-        block_offsets=(1, 2, 3),
+        block_offsets=(1, ),
         default_fee_rate=float(os.getenv("DEMO_PANCAKE_DEFAULT_FEE_RATE", "0.0005")),
     )
 

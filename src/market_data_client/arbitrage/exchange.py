@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import abc
 import asyncio
 import logging
@@ -13,7 +14,7 @@ from urllib import parse as _parse, request as _request
 from urllib import error as _error
 
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple, List
 from decimal import Decimal, ROUND_DOWN
@@ -126,6 +127,26 @@ class InsufficientBalanceError(RuntimeError):
     """Raised when an account does not have enough balance for a simulated trade."""
 
 
+def _env_int(name: str, default: int, *, min_v: int | None = None, max_v: int | None = None) -> int:
+    raw = os.getenv(name)
+    try:
+        v = default if raw is None or raw == "" else int(raw)
+    except Exception:
+        v = default
+    if min_v is not None:
+        v = max(min_v, v)
+    if max_v is not None:
+        v = min(max_v, v)
+    return v
+
+
+def _default_block_offsets() -> Tuple[int, ...]:
+    # Default keeps current behavior: (1, 2, 3)
+    runs = _env_int("DEX_SIM_RUNS", 3, min_v=1, max_v=50)
+    stride = _env_int("DEX_SIM_BLOCK_STRIDE", 1, min_v=0, max_v=10_000)
+    base = _env_int("DEX_SIM_BASE_OFFSET", 1, min_v=0, max_v=10_000)
+    return tuple(base + i * stride for i in range(runs))
+
 @dataclass
 class TradeResult:
     """
@@ -207,7 +228,7 @@ class PancakeDemoParams:
     build_swap_tx: Callable[[Any, str, float, str], Dict[str, Any]]
     private_key: Optional[str] = None
     upstream_rpc_url: str = ""
-    block_offsets: Tuple[int, int, int] = (1, 2, 3)
+    block_offsets: Tuple[int, ...] = field(default_factory=_default_block_offsets)
 
     # Extra fee rate (NOT Pancake LP fee). Default 0 to avoid double counting.
     default_fee_rate: float = 0.0
@@ -1191,6 +1212,21 @@ class PancakeSwapDemoExchangeClient(ExchangeClient):
         _apply_poa_middleware(upstream_web3)
 
         base_block = int(upstream_web3.eth.block_number)
+        
+        fork_blocks = [base_block + int(o) for o in offsets]
+
+        logger.info(
+            "[pancake-demo] dex_sim_plan symbol=%s side=%s base_block=%s offsets=%s fork_blocks=%s "
+            "env(DEX_SIM_RUNS=%s DEX_SIM_BLOCK_STRIDE=%s DEX_SIM_BASE_OFFSET=%s)",
+            symbol,
+            side.value if hasattr(side, "value") else str(side),
+            base_block,
+            list(offsets),
+            fork_blocks,
+            os.getenv("DEX_SIM_RUNS", "unset"),
+            os.getenv("DEX_SIM_BLOCK_STRIDE", "unset"),
+            os.getenv("DEX_SIM_BASE_OFFSET", "unset"),
+        )
 
         provider = web3.provider
         if provider is None:
