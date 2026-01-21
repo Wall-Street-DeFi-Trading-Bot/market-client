@@ -425,7 +425,7 @@ class MarketDataClient:
                     lat_source_ms, lat_publish_ms,
                 )
                 await self._h_dex_as_tick(
-                    ex, pair, node,
+                    ex, chain, pair, node,
                     source_ts_ns, publish_ts_ns,
                     lat_source_ms, lat_publish_ms,
                 )
@@ -443,23 +443,62 @@ class MarketDataClient:
                     lat_source_ms, lat_publish_ms,
                 )
             elif which == "fee":
-                await self._h_fee(
-                    exch, sym, inst, node,
-                    source_ts_ns, publish_ts_ns,
-                    lat_source_ms, lat_publish_ms,
-                )
+                if subject.startswith("md.fee.dex."):
+                    parts = subject.split(".")
+                    ex = parts[3] if len(parts) >= 5 else exch
+                    chain = parts[4] if len(parts) >= 6 else ""
+                    pair = parts[5] if len(parts) >= 7 else sym
+                    await self._h_fee(
+                        ex, pair, inst, node,
+                        source_ts_ns, publish_ts_ns,
+                        lat_source_ms, lat_publish_ms,
+                        chain=chain,
+                    )
+                else:
+                    await self._h_fee(
+                        exch, sym, inst, node,
+                        source_ts_ns, publish_ts_ns,
+                        lat_source_ms, lat_publish_ms,
+                        chain=None,
+                    )
             elif which == "volume":
-                await self._h_volume(
-                    exch, sym, inst, node,
-                    source_ts_ns, publish_ts_ns,
-                    lat_source_ms, lat_publish_ms,
-                )
+                if subject.startswith("md.volume.dex."):
+                    parts = subject.split(".")
+                    ex = parts[3] if len(parts) >= 5 else exch
+                    chain = parts[4] if len(parts) >= 6 else ""
+                    pair = parts[5] if len(parts) >= 7 else sym
+                    await self._h_volume(
+                        ex, pair, inst, node,
+                        source_ts_ns, publish_ts_ns,
+                        lat_source_ms, lat_publish_ms,
+                        chain=chain,
+                    )
+                else:
+                    await self._h_volume(
+                        exch, sym, inst, node,
+                        source_ts_ns, publish_ts_ns,
+                        lat_source_ms, lat_publish_ms,
+                        chain=None,
+                    )
             elif which == "slippage":
-                await self._h_slippage(
-                    exch, sym, node,
-                    source_ts_ns, publish_ts_ns,
-                    lat_source_ms, lat_publish_ms,
-                )
+                if subject.startswith("md.slippage.dex."):
+                    parts = subject.split(".")
+                    ex = parts[3] if len(parts) >= 5 else exch
+                    chain = parts[4] if len(parts) >= 6 else ""
+                    pair = parts[5] if len(parts) >= 7 else sym
+                    await self._h_slippage(
+                        ex, pair, node,
+                        source_ts_ns, publish_ts_ns,
+                        lat_source_ms, lat_publish_ms,
+                        chain=chain,
+                    )
+                else:
+                    await self._h_slippage(
+                        exch, sym, node,
+                        source_ts_ns, publish_ts_ns,
+                        lat_source_ms, lat_publish_ms,
+                        chain=None,
+                    )
             else:
                 logger.debug(f"Unknown message type: {which}")
 
@@ -635,6 +674,8 @@ class MarketDataClient:
         publish_ts_ns: int,
         lat_source_ms: Optional[float],
         lat_publish_ms: Optional[float],
+        *,
+        chain: Optional[str] = None,
     ):
         norm_sym = _norm_symbol(symbol)
         inst = instrument.lower()
@@ -649,7 +690,11 @@ class MarketDataClient:
             )
 
         if self.enable_csv and self.csv_dir:
-            path = os.path.join(self.csv_dir, exchange, norm_sym, "fees.csv")
+            parts = [self.csv_dir, exchange]
+            if chain:
+                parts.append(chain)
+            parts.extend([norm_sym, "fees.csv"])
+            path = os.path.join(*parts)
             await _csv_write(
                 path,
                 [
@@ -689,6 +734,7 @@ class MarketDataClient:
             "publish_ts_iso": _iso_from_ns(publish_ts_ns),
             "lat_source_ms": lat_source_ms,
             "lat_publish_ms": lat_publish_ms,
+            "chain": chain,
             # backward compat
             "ts_ns": source_ts_ns,
             "lat_ms": lat_source_ms,
@@ -705,6 +751,8 @@ class MarketDataClient:
         publish_ts_ns: int,
         lat_source_ms: Optional[float],
         lat_publish_ms: Optional[float],
+        *,
+        chain: Optional[str] = None,
     ):
         norm_sym = _norm_symbol(symbol)
         inst = instrument.lower()
@@ -722,7 +770,11 @@ class MarketDataClient:
             )
 
         if self.enable_csv and self.csv_dir:
-            path = os.path.join(self.csv_dir, exchange, norm_sym, "volume.csv")
+            parts = [self.csv_dir, exchange]
+            if chain:
+                parts.append(chain)
+            parts.extend([norm_sym, "volume.csv"])
+            path = os.path.join(*parts)
             await _csv_write(
                 path,
                 [
@@ -771,6 +823,7 @@ class MarketDataClient:
             "publish_ts_iso": _iso_from_ns(publish_ts_ns),
             "lat_source_ms": lat_source_ms,
             "lat_publish_ms": lat_publish_ms,
+            "chain": chain,
             # backward compat
             "ts_ns": source_ts_ns,
             "lat_ms": lat_source_ms,
@@ -812,7 +865,7 @@ class MarketDataClient:
             )
 
         if self.enable_csv and self.csv_dir:
-            path = os.path.join(self.csv_dir, exchange, pair, "swaps.csv")
+            path = os.path.join(self.csv_dir, exchange, chain, pair, "swaps.csv")
             await _csv_write(
                 path,
                 [
@@ -873,6 +926,7 @@ class MarketDataClient:
     async def _h_dex_as_tick(
         self,
         exchange: str,
+        chain: str,
         pair: str,
         ds,
         source_ts_ns: int,
@@ -898,6 +952,58 @@ class MarketDataClient:
                 lat_publish_ms=lat_publish_ms,
             )
 
+        if self.enable_csv and self.csv_dir:
+            path = os.path.join(self.csv_dir, exchange, chain, pair, "ticks.csv")
+            await _csv_write(
+                path,
+                [
+                    "timestamp_source",
+                    "timestamp_publish",
+                    "exchange",
+                    "chain",
+                    "pair",
+                    "instrument",
+                    "bid",
+                    "ask",
+                    "mid",
+                    "lat_source_ms",
+                    "lat_publish_ms",
+                ],
+                {
+                    "timestamp_source": _iso_from_ns(source_ts_ns),
+                    "timestamp_publish": _iso_from_ns(publish_ts_ns),
+                    "exchange": exchange,
+                    "chain": chain,
+                    "pair": pair,
+                    "instrument": "swap",
+                    "bid": price_qb,
+                    "ask": price_qb,
+                    "mid": price_qb,
+                    "lat_source_ms": f"{lat_source_ms:.2f}" if lat_source_ms is not None else "",
+                    "lat_publish_ms": f"{lat_publish_ms:.2f}" if lat_publish_ms is not None else "",
+                },
+            )
+
+        await self._emit({
+            "kind": "tick",
+            "exchange": exchange,
+            "symbol": pair,
+            "pair": pair,
+            "instrument": "swap",
+            "mid": price_qb,
+            "bid": price_qb,
+            "ask": price_qb,
+            "source_ts_ns": source_ts_ns,
+            "publish_ts_ns": publish_ts_ns,
+            "source_ts_iso": _iso_from_ns(source_ts_ns),
+            "publish_ts_iso": _iso_from_ns(publish_ts_ns),
+            "lat_source_ms": lat_source_ms,
+            "lat_publish_ms": lat_publish_ms,
+            # backward compat
+            "ts_ns": source_ts_ns,
+            "lat_ms": lat_source_ms,
+        })
+
 
     async def _h_slippage(
         self,
@@ -908,6 +1014,8 @@ class MarketDataClient:
         publish_ts_ns: int,
         lat_source_ms: Optional[float],
         lat_publish_ms: Optional[float],
+        *,
+        chain: Optional[str] = None,
     ):
         async with self._lock:
             self.slip[(exchange, symbol)] = Slippage(
@@ -922,7 +1030,11 @@ class MarketDataClient:
             )
 
         if self.enable_csv and self.csv_dir:
-            path = os.path.join(self.csv_dir, exchange, symbol, "slippage.csv")
+            parts = [self.csv_dir, exchange]
+            if chain:
+                parts.append(chain)
+            parts.extend([symbol, "slippage.csv"])
+            path = os.path.join(*parts)
             await _csv_write(
                 path,
                 [
@@ -965,6 +1077,7 @@ class MarketDataClient:
             "publish_ts_iso": _iso_from_ns(publish_ts_ns),
             "lat_source_ms": lat_source_ms,
             "lat_publish_ms": lat_publish_ms,
+            "chain": chain,
             # backward compat
             "ts_ns": source_ts_ns,
             "lat_ms": lat_source_ms,
@@ -1114,6 +1227,7 @@ class MarketDataClient:
             "publish_ts_iso": _iso_from_ns(t.publish_ts_ns),
             "lat_source_ms": t.lat_source_ms,
             "lat_publish_ms": t.lat_publish_ms,
+            "lat_ms": t.lat_source_ms,
             "instrument": t.instrument,
             "exchange": exchange,
             "symbol": _norm_symbol(symbol),
@@ -1135,6 +1249,7 @@ class MarketDataClient:
                 "publish_ts_iso": _iso_from_ns(dp.publish_ts_ns),
                 "lat_source_ms": dp.lat_source_ms,
                 "lat_publish_ms": dp.lat_publish_ms,
+                "lat_ms": dp.lat_source_ms,
             }
 
 

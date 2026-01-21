@@ -380,12 +380,17 @@ class ArbitrageDetector:
                 f"Latency={lat_str}"
             )
 
+            lat_ms = (
+                dex_price.get("lat_ms")
+                or dex_price.get("lat_source_ms")
+                or dex_price.get("lat_publish_ms")
+            )
             # Return canonical quote/base price
             return {
                 "mid": price_qb_canonical,
                 "bid": price_qb_canonical,   # Treat DEX as a single executable price
                 "ask": price_qb_canonical,
-                "lat_ms": dex_price.get("lat_ms"),
+                "lat_ms": lat_ms,
                 "ts_iso": dex_price.get("ts_iso"),
                 "instrument": "swap",
                 "exchange": exchange,
@@ -397,7 +402,12 @@ class ArbitrageDetector:
             symbol, exchange, instrument
         )
         if price_data:
-            lat_str = f"{price_data.get('lat_ms', 0):.1f}ms" if price_data.get('lat_ms') else "N/A"
+            lat_val = (
+                price_data.get("lat_ms")
+                or price_data.get("lat_source_ms")
+                or price_data.get("lat_publish_ms")
+            )
+            lat_str = f"{lat_val:.1f}ms" if lat_val else "N/A"
             logger.info(
                 f"  ✓ {exchange} ({instrument}): "
                 f"Bid={price_data['bid']:.4f}, Ask={price_data['ask']:.4f}, "
@@ -544,9 +554,9 @@ class ArbitrageDetector:
         if price_diff <= 0:
             return None
         
-        # Temporary default fees (will be overwritten later with real values)
-        buy_fee = 0.001
-        sell_fee = 0.001
+        # Start with zero; real 수수료/슬리피지는 후단에서 덮어씀
+        buy_fee = 0.0
+        sell_fee = 0.0
         
         # Gross profit percentage (before fees and slippage)
         gross_profit_pct = price_diff_pct
@@ -562,10 +572,6 @@ class ArbitrageDetector:
         
         net_profit_pct = gross_profit_pct - total_fee_pct - total_slippage_pct
         net_profit_per_unit = buy_price * (net_profit_pct / 100)
-        
-        # Only return if profit exceeds minimum threshold
-        if net_profit_pct < self.min_profit_pct:
-            return None
         
         return ArbitrageOpportunity(
             symbol=symbol,
